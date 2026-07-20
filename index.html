@@ -44,6 +44,14 @@
   #chatInput input{flex:1;}
   #roster{display:flex;flex-wrap:wrap;gap:6px;margin-top:4px;}
   #roster span{background:#1a222c;border:1px solid var(--line);border-radius:10px;padding:2px 8px;}
+  .roomlist{display:flex;flex-direction:column;gap:6px;}
+  .roomlist .muted{color:#6b7888;font-style:italic;font-size:11px;}
+  .rroom{display:flex;justify-content:space-between;align-items:center;background:#1a222c;border:1px solid var(--line);
+    border-radius:8px;padding:6px 10px;cursor:pointer;}
+  .rroom:hover{border-color:var(--accent);}
+  .rroom.cur{opacity:.6;cursor:default;border-style:dashed;}
+  .rroom .rn{color:var(--accent);font-weight:600;}
+  .rroom .rc{color:#6b7888;font-size:11px;}
 </style>
 </head>
 <body>
@@ -92,6 +100,10 @@
       <label>房间 ROOM</label>
       <input type="text" id="room" placeholder="main" />
       <button id="join" style="margin-top:6px;">切换房间</button>
+    </div>
+    <div class="row">
+      <label>活跃房间</label>
+      <div id="roomList" class="roomlist"><span class="muted">（加载中…）</span></div>
     </div>
     <div class="row"><button id="save">保存 PNG</button></div>
     <div class="row"><button id="copy">复制邀请链接</button></div>
@@ -210,7 +222,7 @@ setInterval(drawCursors, 1000);
 
 // ---------- 指针交互 ----------
 let drawing = false, current = null, tool = 'pen', color = '#f78c6c', width = 4, fill = false;
-function pos(e){ const r = cv.getBoundingClientRect(); return { x:e.clientX-r.left, y:e.clientY-r.top }; }
+function pos(e){ const r = cv.getBoundingClientRect(); return { x:e.clientX-r.left, y:e.clientY-r.top, p:(typeof e.pressure==='number' ? e.pressure : 0.5) }; }
 cv.addEventListener('pointerdown', e=>{
   drawing = true; cv.setPointerCapture(e.pointerId);
   const p = pos(e);
@@ -263,7 +275,7 @@ $('fill').onchange = e=> fill = e.target.checked;
 $('clear').onclick = ()=>{ strokes=[]; current=null; history=[[]]; hptr=0; redraw(); send({type:'clear'}); };
 $('undo').onclick = undo;
 $('redo').onclick = redo;
-$('join').onclick = ()=>{ const v=$('room').value.trim()||'main'; location.search='?room='+encodeURIComponent(v); };
+$('join').onclick = ()=>{ manualLeave = true; clearTimeout(reconnectTimer); const v=$('room').value.trim()||'main'; location.search='?room='+encodeURIComponent(v); };
 $('save').onclick = ()=>{
   const a=document.createElement('a'); a.download='collabboard.png'; a.href=cv.toDataURL('image/png'); a.click();
 };
@@ -281,12 +293,8 @@ window.addEventListener('keydown', e=>{
   else if(e.ctrlKey && (e.key==='y'||e.key==='Y' || (e.shiftKey && (e.key==='z'||e.key==='Z')))){ e.preventDefault(); redo(); }
 });
 
-function undo(){
-  if(hptr>0){ hptr--; strokes=clone(history[hptr]); redraw(); send({type:'replace', strokes}); }
-}
-function redo(){
-  if(hptr<history.length-1){ hptr++; strokes=clone(history[hptr]); redraw(); send({type:'replace', strokes}); }
-}
+function undo(){ send({type:'undo'}); }     // 撤销/重做改为服务端权威快照栈，跨端同步
+function redo(){ send({type:'redo'}); }
 
 // ---------- 昵称 / 在线名单 / 聊天 ----------
 function addChat(text, who, isSys){
@@ -305,6 +313,23 @@ function renderRoster(names){
     const s = document.createElement('span');
     s.textContent = (n === myName ? n + '(我)' : n);
     r.appendChild(s);
+  }
+}
+// 渲染活跃房间列表（来自服务端 room_list 广播）；点击可一键切换到该房间
+function renderRoomList(rooms){
+  const el = $('roomList'); if(!el) return;
+  el.innerHTML = '';
+  if(!rooms.length){ el.innerHTML = '<span class="muted">（暂无其他房间）</span>'; return; }
+  const cur = new URLSearchParams(location.search).get('room') || 'main';
+  for(const rm of rooms){
+    const item = document.createElement('div');
+    item.className = 'rroom' + (rm.name === cur ? ' cur' : '');
+    item.innerHTML = '<span class="rn"></span><span class="rc">·' + rm.clients + '人在线 ·' + rm.strokes + '笔</span>';
+    item.querySelector('.rn').textContent = rm.name;
+    if(rm.name !== cur){
+      item.onclick = ()=>{ location.search = '?room=' + encodeURIComponent(rm.name); };
+    }
+    el.appendChild(item);
   }
 }
 function setName(){
@@ -340,16 +365,26 @@ $('chatText').addEventListener('keydown', e=>{ if(e.key==='Enter'){ e.preventDef
 
 // ---------- WebSocket 同步 ----------
 let ws = null, online = 1, lastCursor = 0;
+let manualLeave = false;          // 主动离开/切换房间时不自动重连
+let reconnectTimer = null;
+let reconnectDelay = 1500;        // 重连退避（毫秒），成功后重置，上限 8s
 function send(obj){ if(ws && ws.readyState===1) ws.send(JSON.stringify(obj)); }
+function scheduleReconnect(){
+  if(manualLeave) return;
+  $('conn').textContent = '重连中…';
+  clearTimeout(reconnectTimer);
+  reconnectTimer = setTimeout(()=>{ reconnectDelay = Math.min(reconnectDelay * 2, 8000); connect(); }, reconnectDelay);
+}
 function connect(){
   const room = new URLSearchParams(location.search).get('room') || 'main';
   $('roomName').textContent = room;
+  manualLeave = false;
   try{
     ws = new WebSocket('ws://' + (location.hostname || 'localhost') + ':8080/?room=' + encodeURIComponent(room));
-  }catch(e){ return; }
-  ws.onopen = ()=>{ $('conn').textContent='已连接'; send({type:'set_name', name: myName}); send({type:'cursor', id:myId, color:myColor, x:-99, y:-99}); };
-  ws.onclose = ()=>{ $('conn').textContent='离线(本地模式)'; };
-  ws.onerror = ()=>{ $('conn').textContent='离线(本地模式)'; };
+  }catch(e){ scheduleReconnect(); return; }
+  ws.onopen = ()=>{ $('conn').textContent='已连接'; reconnectDelay = 1500; send({type:'set_name', name: myName}); send({type:'cursor', id:myId, color:myColor, x:-99, y:-99}); };
+  ws.onclose = ()=>{ if(manualLeave){ $('conn').textContent='已离开'; } else { scheduleReconnect(); } };
+  ws.onerror = ()=>{ /* 错误后浏览器会触发 onclose，由 onclose 统一调度重连 */ };
   ws.onmessage = ev=>{
     const m = JSON.parse(ev.data);
     switch(m.type){
@@ -379,6 +414,9 @@ function connect(){
       case 'presence':
         $('online').textContent = m.count;
         if(Array.isArray(m.names)) renderRoster(m.names);
+        break;
+      case 'room_list':
+        renderRoomList(m.rooms || []);
         break;
     }
   };

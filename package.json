@@ -5,7 +5,7 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node _store_test.js && node _wb_text_test.js && node _http_test.js && node _typing_test.js"
+    "test": "node _store_test.js && node _wb_text_test.js && node _http_test.js && node _typing_test.js && node _history_test.js && node _attr_test.js && node _reconnect_test.js && node _pressure_test.js && node _roomlist_test.js"
   },
   "keywords": ["websocket", "whiteboard", "collaboration", "canvas", "node", "rfc6455", "realtime"],
   "author": "hzzqq",

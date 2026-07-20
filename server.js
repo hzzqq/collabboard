@@ -4,8 +4,9 @@
 const net = require('net');
 const crypto = require('crypto');
 const store = require('./store');
+const hist = require('./history');
 
-const PORT = 8080;
+const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 8080;
 const GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
 
 // 连接调色板（服务端为每个连接分配唯一颜色）+ 心跳间隔
@@ -22,6 +23,7 @@ function getRoom(name){
     const saved = store.loadRoom(name);
     if(saved){ r.strokes = saved.strokes; r.chats = saved.chats; }
     rooms.set(name, r);
+    hist.ensureHistory(r);
   }
   return r;
 }
@@ -42,6 +44,17 @@ function broadcast(room, str, except){
 function presence(room){
   const names = [...room.clients].map(c => c.name || ('用户' + (c._cid || '?')));
   broadcast(room, JSON.stringify({ type:'presence', count: room.clients.size, names }));
+}
+// 全局房间列表负载：所有房间名 + 笔画数 + 在线人数（供大厅展示活跃房间）
+function roomListPayload(){
+  const out = [];
+  for(const [name, r] of rooms) out.push({ name, strokes: r.strokes.length, clients: r.clients.size });
+  return out;
+}
+// 向所有房间的所有客户端广播最新房间列表（任一房间有人加入/离开时调用）
+function broadcastRoomList(){
+  const payload = JSON.stringify({ type: 'room_list', rooms: roomListPayload() });
+  for(const room of rooms.values()) broadcast(room, payload);
 }
 
 // ---- 极简 HTTP 管理 API（非 WS 的 GET 请求走这里）----
@@ -97,19 +110,36 @@ function handleData(sock, buf, room){
       try{
         const obj = JSON.parse(msg);
         switch(obj.type){
-          case 'stroke':  room.strokes.push(obj.stroke); broadcast(room, msg, sock); store.saveRoom(room.name, room); break;
+          case 'stroke':
+            if(obj.stroke && typeof obj.stroke === 'object'){
+              obj.stroke.author = sock._cid;          // 服务端权威署名，覆盖客户端伪造
+              obj.stroke.authorColor = sock.color;
+            }
+            hist.commitStrokes(room, room.strokes.concat(obj.stroke)); broadcast(room, JSON.stringify(obj), sock); store.saveRoom(room.name, room); break;
           case 'text':
             if(typeof obj.text !== 'string') break;
             {
               const t = { type:'text', x: +obj.x||0, y: +obj.y||0,
                 text: obj.text.slice(0, 200), color: typeof obj.color==='string'?obj.color:'#ffffff',
-                width: +obj.width||16 };
-              room.strokes.push(t); broadcast(room, JSON.stringify(t), sock);
+                width: +obj.width||16, author: sock._cid, authorColor: sock.color };
+              hist.commitStrokes(room, room.strokes.concat(t)); broadcast(room, JSON.stringify(t), sock);
               store.saveRoom(room.name, room);
             }
             break;
-          case 'replace': room.strokes = obj.strokes || []; broadcast(room, msg, sock); store.saveRoom(room.name, room); break;
-          case 'clear':   room.strokes = []; broadcast(room, msg, sock); store.saveRoom(room.name, room); break;
+          case 'replace': hist.commitStrokes(room, obj.strokes || []); broadcast(room, msg, sock); store.saveRoom(room.name, room); break;
+          case 'clear':   hist.commitStrokes(room, []); broadcast(room, msg, sock); store.saveRoom(room.name, room); break;
+          case 'undo':
+            if(hist.undo(room)){
+              const rmsg = JSON.stringify({ type:'replace', strokes: room.strokes });
+              broadcast(room, rmsg); store.saveRoom(room.name, room);
+            }
+            break;
+          case 'redo':
+            if(hist.redo(room)){
+              const rmsg = JSON.stringify({ type:'replace', strokes: room.strokes });
+              broadcast(room, rmsg); store.saveRoom(room.name, room);
+            }
+            break;
           case 'cursor':  broadcast(room, msg, sock); break;       // 不存储，仅转发
           case 'typing':
             broadcast(room, JSON.stringify({ type:'typing', id: sock._cid, name: sock.name || '匿名', on: obj.on !== false }), sock);
@@ -125,6 +155,7 @@ function handleData(sock, buf, room){
             broadcast(room, JSON.stringify(chat), sock);   // 仅转发给他人
             store.saveRoom(room.name, room); break;
           case 'request_snapshot': sendFrame(sock, JSON.stringify({ type:'snapshot', strokes: room.strokes })); break;
+          case 'room_list': sendFrame(sock, JSON.stringify({ type:'room_list', rooms: roomListPayload() })); break;
         }
       }catch(e){ /* ignore */ }
     }
@@ -171,16 +202,17 @@ const server = net.createServer(sock=>{
       sendFrame(sock, JSON.stringify({ type:'welcome', id: sock._cid, color: sock.color, room: roomName }));
       sendFrame(sock, JSON.stringify({ type:'snapshot', strokes: room.strokes, chats: room.chats, room: roomName }));
       presence(room);
+      broadcastRoomList();
       if(buffer.length) buffer = handleData(sock, buffer, room);
       return;
     }
     buffer = handleData(sock, Buffer.concat([buffer, data]), sock.room);
   });
   sock.on('close', ()=>{
-    if(sock.room){ sock.room.clients.delete(sock); presence(sock.room); }
+    if(sock.room){ sock.room.clients.delete(sock); presence(sock.room); broadcastRoomList(); }
   });
   sock.on('error', ()=>{
-    if(sock.room){ sock.room.clients.delete(sock); presence(sock.room); }
+    if(sock.room){ sock.room.clients.delete(sock); presence(sock.room); broadcastRoomList(); }
   });
 });
 
