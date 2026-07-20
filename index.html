@@ -77,6 +77,7 @@
       <button data-tool="ellipse">椭圆</button>
       <button data-tool="text">文字</button>
       <button data-tool="eraser">橡皮</button>
+      <button data-tool="select">选择/移动</button>
       <button id="clear">清屏</button>
     </div>
     <div class="row">
@@ -105,6 +106,14 @@
       <label>活跃房间</label>
       <div id="roomList" class="roomlist"><span class="muted">（加载中…）</span></div>
     </div>
+    <div class="row">
+      <label>房间锁定 <span id="lockState" class="val"></span></label>
+      <div class="tools">
+        <button id="lockBtn">🔒 锁定</button>
+        <button id="unlockBtn">🔓 解锁</button>
+      </div>
+      <div style="font-size:11px;color:#6b7888;margin-top:6px;">房主：<span id="ownerName">—</span></div>
+    </div>
     <div class="row"><button id="save">保存 PNG</button></div>
     <div class="row"><button id="copy">复制邀请链接</button></div>
     <div class="row"><button id="export">导出白板 JSON</button></div>
@@ -113,7 +122,8 @@
       <code>net</code> 手写 WebSocket，按房间隔离广播。<br><br>
       右侧聊天栏可与同房间伙伴对话；左栏可设置<b>昵称</b>、查看<b>在线名单</b>。<br><br>
       启动：<code>node server.js</code><br>
-      快捷键：<code>Ctrl+Z</code> 撤销 / <code>Ctrl+Y</code> 重做
+      快捷键：<code>Ctrl+Z</code> 撤销 / <code>Ctrl+Y</code> 重做<br>
+      「选择/移动」工具可拖动已画元素（文字/图形整体平移，松手同步他人）
     </div>
   </div>
   <div id="stage">
@@ -220,12 +230,46 @@ function drawCursors(){
 }
 setInterval(drawCursors, 1000);
 
+// ---------- 选择 / 移动 ----------
+let localSeq = 0;   // 客户端生成元素 id（与服务端保持一致，便于移动引用）
+function translateLocal(el, dx, dy){
+  if(!el) return;
+  if(el.type === 'text'){ el.x += dx; el.y += dy; }
+  else if(Array.isArray(el.points)){ for(const p of el.points){ p.x += dx; p.y += dy; } }
+}
+// 命中测试：从顶层（数组末尾）优先，返回最上层命中的元素（含 8px 容差）
+function hitTest(x, y){
+  for(let i = strokes.length - 1; i >= 0; i--){
+    const s = strokes[i];
+    if(!s || s.id == null) continue;
+    let bb;
+    if(s.type === 'text'){
+      const w = (s.text ? s.text.length : 1) * Math.max(10, s.width) * 0.6;
+      const h = Math.max(12, s.width) * 1.2;
+      bb = { x: s.x, y: s.y, w, h };
+    } else if(Array.isArray(s.points) && s.points.length){
+      let minx=Infinity, miny=Infinity, maxx=-Infinity, maxy=-Infinity;
+      for(const p of s.points){ if(p.x<minx)minx=p.x; if(p.y<miny)miny=p.y; if(p.x>maxx)maxx=p.x; if(p.y>maxy)maxy=p.y; }
+      bb = { x:minx, y:miny, w:maxx-minx, h:maxy-miny };
+    } else continue;
+    const pad = 8;
+    if(x >= bb.x-pad && x <= bb.x+bb.w+pad && y >= bb.y-pad && y <= bb.y+bb.h+pad) return s;
+  }
+  return null;
+}
+
 // ---------- 指针交互 ----------
 let drawing = false, current = null, tool = 'pen', color = '#f78c6c', width = 4, fill = false;
+let dragging = false, dragEl = null, startX = 0, startY = 0, lastX = 0, lastY = 0;
 function pos(e){ const r = cv.getBoundingClientRect(); return { x:e.clientX-r.left, y:e.clientY-r.top, p:(typeof e.pressure==='number' ? e.pressure : 0.5) }; }
 cv.addEventListener('pointerdown', e=>{
-  drawing = true; cv.setPointerCapture(e.pointerId);
   const p = pos(e);
+  if(tool === 'select'){
+    const hit = hitTest(p.x, p.y);
+    if(hit){ dragging = true; dragEl = hit; startX = lastX = p.x; startY = lastY = p.y; cv.setPointerCapture(e.pointerId); }
+    return;
+  }
+  drawing = true; cv.setPointerCapture(e.pointerId);
   current = { tool, color, width, erase: tool==='eraser', fill, points:[p] };
   if(tool==='line'||tool==='rect'||tool==='ellipse') current.points.push(p);
 });
@@ -236,24 +280,40 @@ cv.addEventListener('pointermove', e=>{
     const now = performance.now();
     if(now - lastCursor > 30){ lastCursor = now; send({ type:'cursor', id:myId, color:myColor, x:p.x, y:p.y }); }
   }
+  // 选择模式下拖动已命中的元素（实时预览，松手才发一次总位移）
+  if(dragging && dragEl){
+    const p = pos(e);
+    const dx = p.x - lastX, dy = p.y - lastY;
+    translateLocal(dragEl, dx, dy);
+    lastX = p.x; lastY = p.y; redraw();
+    return;
+  }
   if(!drawing) return;
-  const p = pos(e);
-  if(tool==='pen'||tool==='eraser') current.points.push(p);
-  else current.points[1] = p;
+  const p2 = pos(e);
+  if(tool==='pen'||tool==='eraser') current.points.push(p2);
+  else current.points[1] = p2;
   redraw();
 });
 cv.addEventListener('pointerup', ()=>{
+  if(dragging && dragEl){
+    dragging = false;
+    const tdx = lastX - startX, tdy = lastY - startY;
+    if(tdx !== 0 || tdy !== 0) send({ type:'move', id: dragEl.id, dx: tdx, dy: tdy });
+    dragEl = null; redraw(); return;
+  }
   if(!drawing) return; drawing = false;
   if(current && current.tool === 'text'){
     const t = (typeof prompt === 'function') ? prompt('输入文字：') : null;
     if(t && t.trim()){
       current.text = t.trim();
+      current.id = myId + ':' + (++localSeq);
       strokes.push(current); snapshot();
-      send({ type:'text', text: current.text, x: current.points[0].x, y: current.points[0].y, color, width });
+      send({ type:'text', text: current.text, id: current.id, x: current.points[0].x, y: current.points[0].y, color, width });
     }
     current = null; redraw(); return;
   }
   if(current){
+    current.id = myId + ':' + (++localSeq);
     const isEmpty = current.points.length<2 || (current.points.length===2 && current.tool!=='pen' && current.tool!=='eraser' && current.points[0].x===current.points[1].x && current.points[0].y===current.points[1].y);
     if(!isEmpty){
       strokes.push(current); snapshot(); send({ type:'stroke', stroke:current });
@@ -267,6 +327,7 @@ document.querySelectorAll('[data-tool]').forEach(b=>{
   b.onclick = ()=>{
     document.querySelectorAll('[data-tool]').forEach(x=>x.classList.remove('on'));
     b.classList.add('on'); tool = b.dataset.tool;
+    cv.style.cursor = (tool === 'select') ? 'move' : 'crosshair';
   };
 });
 $('color').oninput = e=> color = e.target.value;
@@ -392,6 +453,12 @@ function connect(){
         strokes.push(m.stroke); history = history.slice(0,hptr+1); history.push(clone(strokes)); hptr++; redraw(); break;
       case 'text':
         strokes.push(m); history = history.slice(0,hptr+1); history.push(clone(strokes)); hptr++; redraw(); break;
+      case 'move':
+        {
+          const el = strokes.find(s => s && s.id === m.id);
+          if(el){ translateLocal(el, m.dx, m.dy); redraw(); }
+        }
+        break;
       case 'replace':
         strokes = clone(m.strokes||[]); history=[clone(strokes)]; hptr=0; redraw(); break;
       case 'clear':
@@ -418,9 +485,30 @@ function connect(){
       case 'room_list':
         renderRoomList(m.rooms || []);
         break;
+      case 'owner':
+        roomOwner = m.owner; roomLocked = !!m.locked; updateLockUI(); break;
+      case 'lock':
+        roomLocked = !!m.locked; updateLockUI();
+        addChat(m.locked ? '房间已被锁定，仅房主可编辑' : '房间已解锁', '', true);
+        break;
+      case 'error':
+        addChat('⚠ ' + (m.msg || '操作被拒绝'), '', true); break;
     }
   };
 }
+// 房间锁定 UI 同步
+let roomOwner = null, roomLocked = false;
+function updateLockUI(){
+  const me = (roomOwner === myId);
+  $('lockState').textContent = roomLocked ? '🔒' : '🔓';
+  $('ownerName').textContent = roomOwner == null ? '—' : (me ? '我(房主)' : roomOwner);
+  $('lockBtn').disabled = !me || roomLocked;
+  $('unlockBtn').disabled = !me || !roomLocked;
+  $('lockBtn').style.opacity = (!me || roomLocked) ? .45 : 1;
+  $('unlockBtn').style.opacity = (!me || !roomLocked) ? .45 : 1;
+}
+$('lockBtn').onclick = ()=> send({ type:'lock' });
+$('unlockBtn').onclick = ()=> send({ type:'unlock' });
 connect();
 resize();
 </script>

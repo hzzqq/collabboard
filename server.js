@@ -12,6 +12,7 @@ const GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
 // 连接调色板（服务端为每个连接分配唯一颜色）+ 心跳间隔
 const PALETTE = ['#f78c6c','#7ee787','#82aaff','#c792ea','#ffcb6b','#f07178','#add7ff','#ffd9e0'];
 let connSeq = 0;
+let strokeSeq = 0;   // 元素唯一 id 序列（服务端权威署名，客户端带 id 则保留）
 const HB = process.env.HB ? Math.max(200, +process.env.HB) : 30000;
 
 // rooms: name -> { clients:Set<sock>, strokes:[], chats:[] }
@@ -19,7 +20,7 @@ const rooms = new Map();
 function getRoom(name){
   let r = rooms.get(name);
   if(!r){
-    r = { clients: new Set(), strokes: [], chats: [], name };
+    r = { clients: new Set(), strokes: [], chats: [], name, owner: null, locked: false };
     const saved = store.loadRoom(name);
     if(saved){ r.strokes = saved.strokes; r.chats = saved.chats; }
     rooms.set(name, r);
@@ -40,6 +41,17 @@ function sendFrame(sock, str){
 }
 function broadcast(room, str, except){
   for(const c of room.clients){ if(c !== except && !c.destroyed) sendFrame(c, str); }
+}
+// 按 (dx,dy) 平移一个元素（原地修改并返回）：文字平移 x/y，矢量平移 points；同时兼容带 x/y 的矩形/文本
+function translateElement(el, dx, dy){
+  if(!el || typeof el !== 'object') return el;
+  if(el.type === 'text'){ el.x = (el.x||0) + dx; el.y = (el.y||0) + dy; return el; }
+  if(Array.isArray(el.points)){
+    for(const p of el.points){ p.x = (p.x||0) + dx; p.y = (p.y||0) + dy; }
+    return el;
+  }
+  if(el.x != null || el.y != null){ el.x = (el.x||0) + dx; el.y = (el.y||0) + dy; }
+  return el;
 }
 function presence(room){
   const names = [...room.clients].map(c => c.name || ('用户' + (c._cid || '?')));
@@ -105,13 +117,20 @@ function handleData(sock, buf, room){
       const h = Buffer.from([0x8a, len]); sock.write(Buffer.concat([h, payload])); continue;
     }
     if(opcode === 0xA){ sock.alive = true; continue; }            // pong -> 标记存活
-    if(opcode === 0x1){                                           // text
-      const msg = payload.toString('utf8');
-      try{
-        const obj = JSON.parse(msg);
-        switch(obj.type){
+      if(opcode === 0x1){                                           // text
+        const msg = payload.toString('utf8');
+        try{
+          let obj = JSON.parse(msg);
+          // 房间锁定时，非房主的编辑类操作被拒绝（仅回错误给发起者，不广播、不入栈）
+          const EDIT_OPS = new Set(['stroke','text','move','replace','clear','undo','redo']);
+          if(EDIT_OPS.has(obj.type) && room.locked && sock._cid !== room.owner){
+            sendFrame(sock, JSON.stringify({ type:'error', code:'locked', msg:'房间已锁定，仅房主可编辑' }));
+            obj = { type:'__noop__' };
+          }
+          switch(obj.type){
           case 'stroke':
             if(obj.stroke && typeof obj.stroke === 'object'){
+              if(obj.stroke.id == null) obj.stroke.id = sock._cid + ':' + (++strokeSeq);  // 保留客户端 id；否则服务端生成
               obj.stroke.author = sock._cid;          // 服务端权威署名，覆盖客户端伪造
               obj.stroke.authorColor = sock.color;
             }
@@ -119,10 +138,26 @@ function handleData(sock, buf, room){
           case 'text':
             if(typeof obj.text !== 'string') break;
             {
-              const t = { type:'text', x: +obj.x||0, y: +obj.y||0,
+              const t = { type:'text', id: obj.id != null ? obj.id : (sock._cid + ':' + (++strokeSeq)),
+                x: +obj.x||0, y: +obj.y||0,
                 text: obj.text.slice(0, 200), color: typeof obj.color==='string'?obj.color:'#ffffff',
                 width: +obj.width||16, author: sock._cid, authorColor: sock.color };
               hist.commitStrokes(room, room.strokes.concat(t)); broadcast(room, JSON.stringify(t), sock);
+              store.saveRoom(room.name, room);
+            }
+            break;
+          case 'move':
+            {
+              const id = obj.id, dx = +obj.dx||0, dy = +obj.dy||0;
+              if(id == null || (dx === 0 && dy === 0)) break;
+              let found = false;
+              const moved = room.strokes.map(el => {
+                if(el && el.id === id){ found = true; return translateElement(el, dx, dy); }
+                return el;
+              });
+              if(!found) break;                         // 没找到该 id 直接忽略
+              hist.commitStrokes(room, moved);          // 进入撤销栈，支持 Ctrl+Z
+              broadcast(room, JSON.stringify({ type:'move', id, dx, dy }), sock);  // 对端按 delta 平移
               store.saveRoom(room.name, room);
             }
             break;
@@ -156,6 +191,22 @@ function handleData(sock, buf, room){
             store.saveRoom(room.name, room); break;
           case 'request_snapshot': sendFrame(sock, JSON.stringify({ type:'snapshot', strokes: room.strokes })); break;
           case 'room_list': sendFrame(sock, JSON.stringify({ type:'room_list', rooms: roomListPayload() })); break;
+          case 'lock':
+            if(sock._cid === room.owner){
+              room.locked = true;
+              broadcast(room, JSON.stringify({ type:'lock', locked:true, by: room.owner }));
+            } else {
+              sendFrame(sock, JSON.stringify({ type:'error', code:'not_owner', msg:'只有房主能锁定房间' }));
+            }
+            break;
+          case 'unlock':
+            if(sock._cid === room.owner){
+              room.locked = false;
+              broadcast(room, JSON.stringify({ type:'lock', locked:false, by: room.owner }));
+            } else {
+              sendFrame(sock, JSON.stringify({ type:'error', code:'not_owner', msg:'只有房主能解锁房间' }));
+            }
+            break;
         }
       }catch(e){ /* ignore */ }
     }
@@ -196,6 +247,8 @@ const server = net.createServer(sock=>{
       sock.color = PALETTE[(connSeq++) % PALETTE.length];
       sock.alive = true;
       room.clients.add(sock);
+      if(room.owner == null) room.owner = sock._cid;          // 首个加入者成为房主
+      broadcast(room, JSON.stringify({ type:'owner', owner: room.owner, locked: !!room.locked }));
       sock.room = room;
       sock.roomName = roomName;
       buffer = buffer.slice(idx + 4);
@@ -208,12 +261,20 @@ const server = net.createServer(sock=>{
     }
     buffer = handleData(sock, Buffer.concat([buffer, data]), sock.room);
   });
-  sock.on('close', ()=>{
-    if(sock.room){ sock.room.clients.delete(sock); presence(sock.room); broadcastRoomList(); }
-  });
-  sock.on('error', ()=>{
-    if(sock.room){ sock.room.clients.delete(sock); presence(sock.room); broadcastRoomList(); }
-  });
+  function onLeave(s){
+    const room = s.room; if(!room) return;
+    room.clients.delete(s);
+    // 房主离开则提拔下一位客户端为房主并解锁，避免房间被永久锁死
+    if(room.owner === s._cid && room.clients.size > 0){
+      room.owner = room.clients.values().next().value._cid;
+      room.locked = false;
+      broadcast(room, JSON.stringify({ type:'lock', locked:false, by: room.owner }));
+      broadcast(room, JSON.stringify({ type:'owner', owner: room.owner, locked:false }));
+    }
+    presence(room); broadcastRoomList();
+  }
+  sock.on('close', ()=> onLeave(sock));
+  sock.on('error', ()=> onLeave(sock));
 });
 
 server.listen(PORT, ()=> console.log('CollabBoard WS 服务已启动: ws://localhost:' + PORT + '  (房间通过 ?room=NAME 区分)'));

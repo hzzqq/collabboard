@@ -12,6 +12,8 @@
 - **房间命名空间隔离**：`?room=NAME` 按房间隔离画布与在线名单。
 - **多人光标浮层**：实时同步其他用户光标位置与颜色。
 - **绘图工具**：自由笔画、文字、矩形、椭圆（含填充开关）。
+- **元素拖拽移动**：每个元素分配稳定 id，服务端 `move` 指令按 id 平移并广播（可撤销、落盘）。
+- **房间锁定**：首个加入者为房主（owner），`lock/unlock` 仅房主可执行；锁定态下非房主的编辑被拒（仅回 `error` 不广播不入库），房主离开自动提拔下一位并解锁。
 - **撤销 / 重做**：快照式 + `Ctrl+Z` / `Ctrl+Y`，跨端 `replace` 同步。
 - **聊天 + 昵称 + 在线名单**：带昵称的聊天广播、在线用户列表、50 条历史补发。
 - **正在输入指示**：`typing` 消息转发，页面显示「X 正在输入…」，静默 2s 自动收起。
@@ -39,12 +41,19 @@ node server.js
 四套端到端测试（手写 WS / HTTP 客户端）：
 
 ```bash
-node _store_test.js      # 房间磁盘持久化        6/6
-node _wb_text_test.js     # 文字工具 + 图形填充    5/5
-node _http_test.js        # HTTP 管理 API          7/7
-node _typing_test.js      # 正在输入广播           3/3
-# 或一次性跑全部：
 npm test
+# 十一套端到端测试（手写 WS / HTTP 客户端），共 73/73 通过：
+# _store_test      (6/6)  房间磁盘持久化
+# _wb_text_test    (5/5)  文字工具 + 图形填充
+# _move_test       (6/6)  元素拖拽移动（稳定 id / 广播 / 快照平移）
+# _lock_test       (9/9)  房间锁定（房主判定 / 锁定广播 / 非房主编辑被拒 / 解锁）
+# _http_test       (7/7)  HTTP 管理 API
+# _typing_test     (3/3)  正在输入广播
+# _history_test    (11/11) 服务端权威撤销/重做
+# _attr_test       (6/6)  服务端权威署名（防冒名）
+# _reconnect_test  (7/7)  断线重连（指数退避 / 快照同步）
+# _pressure_test   (5/5)  画笔压感
+# _roomlist_test   (7/7)  活跃房间列表
 ```
 
 ## 🏗 架构
@@ -55,7 +64,7 @@ server.js
  ├─ WS 握手 (Sec-WebSocket-Accept) + 帧解析/组装
  ├─ httpServe() —— 非 WS 的 GET 走 HTTP 管理 API
  ├─ rooms Map —— 房间隔离 + presence + 50 条历史
- ├─ handleData() —— stroke/cursor/text/typing/chat/set_name/replace 分发
+ ├─ handleData() —— stroke/cursor/text/typing/chat/set_name/replace/move/lock(unlock) 分发（编辑类 OP 受 lock 守卫）
  └─ 心跳 ping/pong + 死连接回收
 store.js —— 房间数据 getRoom/落盘 (rooms/*.json)
 index.html —— Canvas 绘图 + 多人光标 + 聊天 + 撤销重做 + 导出
