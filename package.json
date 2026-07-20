@@ -1,0 +1,14 @@
+{
+  "name": "collabboard",
+  "version": "1.0.0",
+  "description": "CollabBoard — 零依赖 WebSocket 协作白板（手写 RFC6455）",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node _store_test.js && node _wb_text_test.js && node _http_test.js && node _typing_test.js"
+  },
+  "keywords": ["websocket", "whiteboard", "collaboration", "canvas", "node", "rfc6455", "realtime"],
+  "author": "hzzqq",
+  "license": "MIT",
+  "engines": { "node": ">=16" }
+}

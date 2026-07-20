@@ -1,0 +1,390 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<title>CollabBoard · 实时协作白板</title>
+<style>
+  :root{ --bg:#0a0c10; --panel:#12161d; --line:#1f2730; --txt:#cdd6e0; --accent:#f78c6c; }
+  *{box-sizing:border-box;}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--txt);
+    font-family:ui-monospace,Menlo,Consolas,monospace;overflow:hidden;}
+  #app{display:flex;height:100%;}
+  #panel{width:240px;background:var(--panel);border-right:1px solid var(--line);
+    padding:18px 16px;overflow-y:auto;}
+  #panel h1{font-size:15px;margin:0 0 2px;}
+  #panel .sub{font-size:11px;color:#6b7888;margin-bottom:14px;}
+  .row{margin:12px 0;}
+  .row label{display:block;font-size:12px;color:#9fb0c0;margin-bottom:6px;}
+  .tools{display:grid;grid-template-columns:1fr 1fr;gap:6px;}
+  button{background:#1a222c;color:var(--txt);border:1px solid var(--line);
+    border-radius:6px;padding:8px;font:inherit;cursor:pointer;transition:.15s;}
+  button:hover{border-color:var(--accent);color:var(--accent);}
+  button.on{background:var(--accent);color:#2a0f06;border-color:var(--accent);font-weight:700;}
+  input[type=color]{width:100%;height:34px;background:#0c0f14;border:1px solid var(--line);border-radius:6px;}
+  input[type=range]{width:100%;}
+  input[type=text]{width:100%;background:#0c0f14;color:var(--txt);border:1px solid var(--line);
+    border-radius:6px;padding:7px 8px;font:inherit;}
+  .val{float:right;color:var(--accent);}
+  #stage{flex:1;position:relative;}
+  canvas{display:block;background:#0e1118;cursor:crosshair;}
+  #cv{position:absolute;inset:0;width:100%;height:100%;}
+  #overlay{position:absolute;inset:0;width:100%;height:100%;pointer-events:none;}
+  #status{position:absolute;left:14px;top:12px;font-size:12px;z-index:5;
+    background:rgba(10,12,16,.6);padding:6px 10px;border:1px solid var(--line);border-radius:8px;}
+  #status b{color:var(--accent);}
+  .hint{font-size:11px;color:#6b7888;line-height:1.6;margin-top:14px;border-top:1px solid var(--line);padding-top:12px;}
+  code{color:#9fb0c0;}
+  #chatPanel{width:240px;background:var(--panel);border-left:1px solid var(--line);display:flex;flex-direction:column;}
+  #chatPanel h2{font-size:14px;margin:0;padding:14px 16px 8px;color:var(--accent);}
+  #chatLog{flex:1;overflow-y:auto;padding:0 14px;font-size:12px;line-height:1.6;}
+  #chatLog .msg{margin-bottom:8px;word-break:break-word;}
+  #chatLog .msg b{color:var(--accent);}
+  #chatLog .sys{color:#6b7888;font-style:italic;margin-bottom:8px;}
+  #chatInput{display:flex;gap:6px;padding:10px 14px;border-top:1px solid var(--line);}
+  #chatInput input{flex:1;}
+  #roster{display:flex;flex-wrap:wrap;gap:6px;margin-top:4px;}
+  #roster span{background:#1a222c;border:1px solid var(--line);border-radius:10px;padding:2px 8px;}
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="panel">
+    <h1>CollabBoard</h1>
+    <div class="sub">实时协作白板 · 零依赖 WS</div>
+    <div class="row">
+      <label>昵称</label>
+      <div style="display:flex;gap:6px;">
+        <input type="text" id="name" placeholder="你的昵称" maxlength="24" />
+        <button id="setName">设置</button>
+      </div>
+    </div>
+    <div class="row">
+      <label>在线 (<b id="online2">1</b>)</label>
+      <div id="roster"></div>
+    </div>
+    <div class="row tools">
+      <button data-tool="pen" class="on">画笔</button>
+      <button data-tool="line">直线</button>
+      <button data-tool="rect">矩形</button>
+      <button data-tool="ellipse">椭圆</button>
+      <button data-tool="text">文字</button>
+      <button data-tool="eraser">橡皮</button>
+      <button id="clear">清屏</button>
+    </div>
+    <div class="row">
+      <label>颜色</label>
+      <input type="color" id="color" value="#f78c6c" />
+    </div>
+    <div class="row">
+      <label>粗细 <span class="val" id="wVal">4</span></label>
+      <input type="range" id="width" min="1" max="40" value="4" />
+    </div>
+    <div class="row">
+      <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+        <input type="checkbox" id="fill" /> 填充形状（矩形/椭圆）
+      </label>
+    </div>
+    <div class="row tools">
+      <button id="undo">↶ 撤销</button>
+      <button id="redo">↷ 重做</button>
+    </div>
+    <div class="row">
+      <label>房间 ROOM</label>
+      <input type="text" id="room" placeholder="main" />
+      <button id="join" style="margin-top:6px;">切换房间</button>
+    </div>
+    <div class="row"><button id="save">保存 PNG</button></div>
+    <div class="row"><button id="copy">复制邀请链接</button></div>
+    <div class="row"><button id="export">导出白板 JSON</button></div>
+    <div class="hint">
+      多人打开<b>同一房间</b>即可实时同步（含光标）。服务端 <code>server.js</code> 用 Node 原生
+      <code>net</code> 手写 WebSocket，按房间隔离广播。<br><br>
+      右侧聊天栏可与同房间伙伴对话；左栏可设置<b>昵称</b>、查看<b>在线名单</b>。<br><br>
+      启动：<code>node server.js</code><br>
+      快捷键：<code>Ctrl+Z</code> 撤销 / <code>Ctrl+Y</code> 重做
+    </div>
+  </div>
+  <div id="stage">
+    <div id="status">房间 <b id="roomName">main</b> · 连接 <b id="conn">未连接</b> · 在线 <b id="online">1</b></div>
+    <canvas id="cv"></canvas>
+    <canvas id="overlay"></canvas>
+  </div>
+  <div id="chatPanel">
+    <h2>聊天</h2>
+    <div id="chatLog"></div>
+    <div id="typing" class="sys"></div>
+    <div id="chatInput">
+      <input type="text" id="chatText" placeholder="说点什么…(回车发送)" maxlength="500" />
+      <button id="chatSend">发送</button>
+    </div>
+  </div>
+</div>
+<script>
+const cv = document.getElementById('cv');
+const ctx = cv.getContext('2d');
+const ov = document.getElementById('overlay');
+const octx = ov.getContext('2d');
+const stage = document.getElementById('stage');
+let dpr = Math.min(devicePixelRatio || 1, 2);
+
+let myId = Math.random().toString(36).slice(2, 8);
+const MY_COLORS = ['#f78c6c','#7ee787','#82aaff','#c792ea','#ffcb6b','#f07178'];
+let myColor = MY_COLORS[Math.floor(Math.random()*MY_COLORS.length)];
+const remoteCursors = new Map();
+let myName = '我' + myId.slice(0, 3);
+
+const $ = id => document.getElementById(id);
+const room0 = new URLSearchParams(location.search).get('room') || 'main';
+$('room').value = room0;
+$('name').value = myName;
+
+function resize(){
+  const w = stage.clientWidth, h = stage.clientHeight;
+  cv.width = w*dpr; cv.height = h*dpr; cv.style.width = w+'px'; cv.style.height = h+'px';
+  ov.width = w*dpr; ov.height = h*dpr; ov.style.width = w+'px'; ov.style.height = h+'px';
+  redraw(); drawCursors();
+}
+window.addEventListener('resize', resize);
+
+// ---------- 撤销/重做 (快照式) ----------
+let strokes = [];
+let history = [[]]; let hptr = 0;
+const clone = s => s.map(x => ({ ...x, points: x.points ? x.points.map(p => ({ ...p })) : undefined }));
+function snapshot(){ history = history.slice(0, hptr+1); history.push(clone(strokes)); hptr++; }
+
+// ---------- 绘制 ----------
+function drawStroke(s){
+  ctx.save();
+  ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  ctx.lineWidth = s.width * dpr;
+  ctx.strokeStyle = s.color; ctx.fillStyle = s.color;
+  if(s.type === 'text'){
+    ctx.font = (Math.max(10, s.width) * dpr) + 'px ui-monospace, monospace';
+    ctx.textBaseline = 'top';
+    ctx.fillText(s.text || '', s.x * dpr, s.y * dpr);
+    ctx.restore(); return;
+  }
+  if(s.erase) ctx.globalCompositeOperation = 'destination-out';
+  ctx.beginPath();
+  const p = s.points;
+  if(s.tool === 'pen' || s.tool === 'eraser'){
+    ctx.moveTo(p[0].x*dpr, p[0].y*dpr);
+    for(let i=1;i<p.length;i++) ctx.lineTo(p[i].x*dpr, p[i].y*dpr);
+    ctx.stroke();
+  } else if(s.tool === 'line'){
+    ctx.moveTo(p[0].x*dpr, p[0].y*dpr); ctx.lineTo(p[1].x*dpr, p[1].y*dpr); ctx.stroke();
+  } else if(s.tool === 'rect'){
+    const x=Math.min(p[0].x,p[1].x)*dpr, y=Math.min(p[0].y,p[1].y)*dpr;
+    const w=Math.abs(p[1].x-p[0].x)*dpr, h=Math.abs(p[1].y-p[0].y)*dpr;
+    if(s.fill) ctx.fillRect(x,y,w,h); else ctx.strokeRect(x,y,w,h);
+  } else if(s.tool === 'ellipse'){
+    const cx=((p[0].x+p[1].x)/2)*dpr, cy=((p[0].y+p[1].y)/2)*dpr;
+    const rx=Math.abs(p[1].x-p[0].x)/2*dpr, ry=Math.abs(p[1].y-p[0].y)/2*dpr;
+    ctx.beginPath(); ctx.ellipse(cx,cy,rx,ry,0,0,Math.PI*2);
+    if(s.fill) ctx.fill(); else ctx.stroke();
+  }
+  ctx.restore();
+}
+function redraw(){
+  ctx.clearRect(0,0,cv.width,cv.height);
+  for(const s of strokes) drawStroke(s);
+  if(current) drawStroke(current);
+}
+function drawCursors(){
+  octx.clearRect(0,0,ov.width,ov.height);
+  const now = Date.now();
+  for(const [id, c] of remoteCursors){
+    if(now - c.ts > 4000) continue;
+    const x = c.x*dpr, y = c.y*dpr;
+    octx.save();
+    octx.fillStyle = c.color || '#fff';
+    octx.beginPath();
+    octx.moveTo(x, y); octx.lineTo(x, y+16); octx.lineTo(x+5, y+12); octx.lineTo(x+11, y+11);
+    octx.closePath(); octx.fill();
+    octx.font = (12*dpr)+'px ui-monospace, monospace';
+    octx.fillText(id, x+13, y+12);
+    octx.restore();
+  }
+}
+setInterval(drawCursors, 1000);
+
+// ---------- 指针交互 ----------
+let drawing = false, current = null, tool = 'pen', color = '#f78c6c', width = 4, fill = false;
+function pos(e){ const r = cv.getBoundingClientRect(); return { x:e.clientX-r.left, y:e.clientY-r.top }; }
+cv.addEventListener('pointerdown', e=>{
+  drawing = true; cv.setPointerCapture(e.pointerId);
+  const p = pos(e);
+  current = { tool, color, width, erase: tool==='eraser', fill, points:[p] };
+  if(tool==='line'||tool==='rect'||tool==='ellipse') current.points.push(p);
+});
+cv.addEventListener('pointermove', e=>{
+  // 广播光标
+  if(ws && ws.readyState===1){
+    const p = pos(e);
+    const now = performance.now();
+    if(now - lastCursor > 30){ lastCursor = now; send({ type:'cursor', id:myId, color:myColor, x:p.x, y:p.y }); }
+  }
+  if(!drawing) return;
+  const p = pos(e);
+  if(tool==='pen'||tool==='eraser') current.points.push(p);
+  else current.points[1] = p;
+  redraw();
+});
+cv.addEventListener('pointerup', ()=>{
+  if(!drawing) return; drawing = false;
+  if(current && current.tool === 'text'){
+    const t = (typeof prompt === 'function') ? prompt('输入文字：') : null;
+    if(t && t.trim()){
+      current.text = t.trim();
+      strokes.push(current); snapshot();
+      send({ type:'text', text: current.text, x: current.points[0].x, y: current.points[0].y, color, width });
+    }
+    current = null; redraw(); return;
+  }
+  if(current){
+    const isEmpty = current.points.length<2 || (current.points.length===2 && current.tool!=='pen' && current.tool!=='eraser' && current.points[0].x===current.points[1].x && current.points[0].y===current.points[1].y);
+    if(!isEmpty){
+      strokes.push(current); snapshot(); send({ type:'stroke', stroke:current });
+    }
+  }
+  current = null; redraw();
+});
+
+// ---------- 控件 ----------
+document.querySelectorAll('[data-tool]').forEach(b=>{
+  b.onclick = ()=>{
+    document.querySelectorAll('[data-tool]').forEach(x=>x.classList.remove('on'));
+    b.classList.add('on'); tool = b.dataset.tool;
+  };
+});
+$('color').oninput = e=> color = e.target.value;
+$('width').oninput = e=>{ width=+e.target.value; $('wVal').textContent=width; };
+$('fill').onchange = e=> fill = e.target.checked;
+$('clear').onclick = ()=>{ strokes=[]; current=null; history=[[]]; hptr=0; redraw(); send({type:'clear'}); };
+$('undo').onclick = undo;
+$('redo').onclick = redo;
+$('join').onclick = ()=>{ const v=$('room').value.trim()||'main'; location.search='?room='+encodeURIComponent(v); };
+$('save').onclick = ()=>{
+  const a=document.createElement('a'); a.download='collabboard.png'; a.href=cv.toDataURL('image/png'); a.click();
+};
+$('copy').onclick = async ()=>{
+  try{ await navigator.clipboard.writeText(location.href); $('copy').textContent='已复制 ✓'; setTimeout(()=>$('copy').textContent='复制邀请链接',1500);}catch(e){}
+};
+$('export').onclick = ()=>{
+  const a = document.createElement('a');
+  a.download = 'collabboard_' + (room0 || 'main') + '.json';
+  a.href = 'data:application/json;charset=utf-8,' + encodeURIComponent(JSON.stringify({ room: room0, strokes }));
+  a.click();
+};
+window.addEventListener('keydown', e=>{
+  if(e.ctrlKey && (e.key==='z'||e.key==='Z') && !e.shiftKey){ e.preventDefault(); undo(); }
+  else if(e.ctrlKey && (e.key==='y'||e.key==='Y' || (e.shiftKey && (e.key==='z'||e.key==='Z')))){ e.preventDefault(); redo(); }
+});
+
+function undo(){
+  if(hptr>0){ hptr--; strokes=clone(history[hptr]); redraw(); send({type:'replace', strokes}); }
+}
+function redo(){
+  if(hptr<history.length-1){ hptr++; strokes=clone(history[hptr]); redraw(); send({type:'replace', strokes}); }
+}
+
+// ---------- 昵称 / 在线名单 / 聊天 ----------
+function addChat(text, who, isSys){
+  const log = $('chatLog');
+  const div = document.createElement('div');
+  div.className = 'msg' + (isSys ? ' sys' : '');
+  div.textContent = (who ? who + '：' : '') + text;
+  log.appendChild(div);
+  log.scrollTop = log.scrollHeight;
+}
+function renderRoster(names){
+  const r = $('roster'); r.innerHTML = '';
+  $('online').textContent = names.length;
+  $('online2').textContent = names.length;
+  for(const n of names){
+    const s = document.createElement('span');
+    s.textContent = (n === myName ? n + '(我)' : n);
+    r.appendChild(s);
+  }
+}
+function setName(){
+  const v = $('name').value.trim().slice(0, 24);
+  if(!v) return;
+  myName = v;
+  send({ type:'set_name', name: myName });
+  addChat('你已改名为 ' + myName, '', true);
+}
+$('setName').onclick = setName;
+$('name').addEventListener('keydown', e=>{ if(e.key==='Enter') setName(); });
+function sendChat(){
+  const t = $('chatText').value.trim();
+  if(!t) return;
+  addChat(t, myName);                 // 本地立即显示
+  send({ type:'chat', text: t });     // 服务端转发给其他人
+  $('chatText').value = '';
+  sendTyping(false);
+}
+let amTyping = false, typingTimer = null;
+function sendTyping(on){
+  if(amTyping === on) return;
+  amTyping = on; send({ type:'typing', on });
+}
+$('chatText').addEventListener('input', ()=>{
+  sendTyping(true);
+  clearTimeout(typingTimer);
+  typingTimer = setTimeout(()=> sendTyping(false), 2000);   // 静默 2s 自动收起
+});
+$('chatText').addEventListener('blur', ()=> sendTyping(false));
+$('chatSend').onclick = sendChat;
+$('chatText').addEventListener('keydown', e=>{ if(e.key==='Enter'){ e.preventDefault(); sendChat(); } });
+
+// ---------- WebSocket 同步 ----------
+let ws = null, online = 1, lastCursor = 0;
+function send(obj){ if(ws && ws.readyState===1) ws.send(JSON.stringify(obj)); }
+function connect(){
+  const room = new URLSearchParams(location.search).get('room') || 'main';
+  $('roomName').textContent = room;
+  try{
+    ws = new WebSocket('ws://' + (location.hostname || 'localhost') + ':8080/?room=' + encodeURIComponent(room));
+  }catch(e){ return; }
+  ws.onopen = ()=>{ $('conn').textContent='已连接'; send({type:'set_name', name: myName}); send({type:'cursor', id:myId, color:myColor, x:-99, y:-99}); };
+  ws.onclose = ()=>{ $('conn').textContent='离线(本地模式)'; };
+  ws.onerror = ()=>{ $('conn').textContent='离线(本地模式)'; };
+  ws.onmessage = ev=>{
+    const m = JSON.parse(ev.data);
+    switch(m.type){
+      case 'stroke':
+        strokes.push(m.stroke); history = history.slice(0,hptr+1); history.push(clone(strokes)); hptr++; redraw(); break;
+      case 'text':
+        strokes.push(m); history = history.slice(0,hptr+1); history.push(clone(strokes)); hptr++; redraw(); break;
+      case 'replace':
+        strokes = clone(m.strokes||[]); history=[clone(strokes)]; hptr=0; redraw(); break;
+      case 'clear':
+        strokes=[]; history=[[]]; hptr=0; redraw(); break;
+      case 'welcome':
+        myId = m.id; myColor = m.color; break;
+      case 'snapshot':
+        strokes = clone(m.strokes||[]); history=[clone(strokes)]; hptr=0; redraw();
+        $('chatLog').innerHTML = '';
+        for(const c of (m.chats||[])) addChat(c.text, c.name);
+        break;
+      case 'cursor':
+        if(m.id !== myId){ remoteCursors.set(m.id, { x:m.x, y:m.y, color:m.color, ts:Date.now() }); drawCursors(); }
+        break;
+      case 'chat':
+        if(m.name !== myName) addChat(m.text, m.name); break;
+      case 'typing':
+        if(m.id !== myId){ $('typing').textContent = (m.on ? ((m.name || '某人') + ' 正在输入…') : ''); }
+        break;
+      case 'presence':
+        $('online').textContent = m.count;
+        if(Array.isArray(m.names)) renderRoster(m.names);
+        break;
+    }
+  };
+}
+connect();
+resize();
+</script>
+</body>
+</html>

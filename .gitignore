@@ -1,0 +1,6 @@
+node_modules/
+*.log
+.DS_Store
+.env
+# 白板房间持久化数据（运行时生成）
+rooms/
