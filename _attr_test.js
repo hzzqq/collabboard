@@ -1,3 +1,4 @@
+const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 8090;
 // CollabBoard 署名归属测试：服务端对笔画/文字强制盖章 author=连接id、authorColor=连接调色板色，
 // 客户端无法伪造（即使恶意提供 author 也会被覆盖）。c1 发送，c2 作为旁观者收到被盖章的数据。
 const { spawn } = require('child_process');
@@ -53,7 +54,7 @@ function parseMsgs(buf){
 (async ()=>{
   const port = await freePort();
   const server = spawn(process.execPath, [path.join(__dirname, 'server.js')],
-    { env: { ...process.env, HB: '999999', PORT: String(port) }, stdio: 'ignore' });
+    { env: { ...process.env, PORT: String(PORT), HB: '999999', PORT: String(port) }, stdio: 'ignore' });
   await new Promise(r => setTimeout(r, 700));
   const strokes = [];
   try {

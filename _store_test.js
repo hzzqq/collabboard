@@ -1,3 +1,4 @@
+const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 8090;
 // store.js 单元测试：save/load 往返 + text 保留 + 不存在返回 null + 删除。
 const store = require('./store');
 let pass = 0, fail = 0;

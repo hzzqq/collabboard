@@ -1,3 +1,4 @@
+const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 8090;
 // CollabBoard 房间列表测试：服务端支持 WS `room_list` 消息（返回所有活跃房间名+笔画数+人数），
 // 并在任意房间有人加入/离开时向所有客户端广播最新房间列表。使用唯一房间名避免跨运行残留。
 const { spawn } = require('child_process');
@@ -68,7 +69,7 @@ function findRoom(list, name){ return Array.isArray(list) ? list.find(r => r.nam
   const roomA = 'A_' + suffix, roomB = 'B_' + suffix;
   const port = await freePort();
   const server = spawn(process.execPath, [path.join(__dirname, 'server.js')],
-    { env: { ...process.env, HB: '999999', PORT: String(port) }, stdio: 'ignore' });
+    { env: { ...process.env, PORT: String(PORT), HB: '999999', PORT: String(port) }, stdio: 'ignore' });
   await new Promise(r => setTimeout(r, 800));
   try {
     const c1 = await wsConnect(roomA, port);

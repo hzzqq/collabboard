@@ -78,8 +78,13 @@
       <button data-tool="text">文字</button>
       <button data-tool="eraser">橡皮</button>
       <button data-tool="select">选择/移动</button>
+      <button data-tool="marquee">▢ 框选</button>
+      <button id="imgBtn">🖼 插入图片</button>
       <button id="clear">清屏</button>
+      <button id="selAll">☑ 全选</button>
+      <button id="selNone">✕ 取消选择</button>
     </div>
+    <input type="file" id="imgInput" accept="image/*" style="display:none;" />
     <div class="row">
       <label>颜色</label>
       <input type="color" id="color" value="#f78c6c" />
@@ -115,6 +120,7 @@
       <div style="font-size:11px;color:#6b7888;margin-top:6px;">房主：<span id="ownerName">—</span></div>
     </div>
     <div class="row"><button id="save">保存 PNG</button></div>
+<div class="row"><button id="saveSvg">导出 SVG（矢量）</button></div>
     <div class="row"><button id="copy">复制邀请链接</button></div>
     <div class="row"><button id="export">导出白板 JSON</button></div>
     <div class="hint">
@@ -123,7 +129,7 @@
       右侧聊天栏可与同房间伙伴对话；左栏可设置<b>昵称</b>、查看<b>在线名单</b>。<br><br>
       启动：<code>node server.js</code><br>
       快捷键：<code>Ctrl+Z</code> 撤销 / <code>Ctrl+Y</code> 重做<br>
-      「选择/移动」工具可拖动已画元素（文字/图形整体平移，松手同步他人）
+      「选择/移动」工具可拖动已画元素（文字/图形整体平移，松手同步他人）。<b>▢ 框选</b>工具拖出矩形即可多选，选中后拖动任一元素会<b>整组移动</b>（服务端按 id 列表平移并广播）；<b>☑ 全选</b>/<b>✕ 取消选择</b>或 <code>Esc</code> 管理选区。
     </div>
   </div>
   <div id="stage">
@@ -141,6 +147,7 @@
     </div>
   </div>
 </div>
+<script src="svg.js"></script>
 <script>
 const cv = document.getElementById('cv');
 const ctx = cv.getContext('2d');
@@ -171,6 +178,7 @@ window.addEventListener('resize', resize);
 // ---------- 撤销/重做 (快照式) ----------
 let strokes = [];
 let history = [[]]; let hptr = 0;
+const imgCache = new Map();   // 图片元素缓存（id -> HTMLImageElement）
 const clone = s => s.map(x => ({ ...x, points: x.points ? x.points.map(p => ({ ...p })) : undefined }));
 function snapshot(){ history = history.slice(0, hptr+1); history.push(clone(strokes)); hptr++; }
 
@@ -178,6 +186,13 @@ function snapshot(){ history = history.slice(0, hptr+1); history.push(clone(stro
 function drawStroke(s){
   ctx.save();
   ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  if(s.type === 'image'){
+    const key = s.id || s.src;
+    let im = imgCache.get(key);
+    if(!im){ im = new Image(); im.onload = redraw; im.src = s.src; imgCache.set(key, im); }
+    if(im.complete && im.naturalWidth) ctx.drawImage(im, s.x*dpr, s.y*dpr, s.w*dpr, s.h*dpr);
+    ctx.restore(); return;
+  }
   ctx.lineWidth = s.width * dpr;
   ctx.strokeStyle = s.color; ctx.fillStyle = s.color;
   if(s.type === 'text'){
@@ -210,6 +225,8 @@ function drawStroke(s){
 function redraw(){
   ctx.clearRect(0,0,cv.width,cv.height);
   for(const s of strokes) drawStroke(s);
+  for(const s of strokes) if(selectedIds.has(s.id)){ const b = bboxOf(s); if(b) drawSelBox(b); }
+  if(marquee) drawMarquee(marquee);
   if(current) drawStroke(current);
 }
 function drawCursors(){
@@ -258,16 +275,54 @@ function hitTest(x, y){
   return null;
 }
 
+// 元素包围盒（用于框选命中与高亮）
+function bboxOf(s){
+  if(s.type === 'text'){
+    const w = (s.text ? s.text.length : 1) * Math.max(10, s.width) * 0.6;
+    const h = Math.max(12, s.width) * 1.2;
+    return { x:s.x, y:s.y, w, h };
+  }
+  if(s.type === 'image'){ return { x:s.x, y:s.y, w:s.w||0, h:s.h||0 }; }
+  if(Array.isArray(s.points) && s.points.length){
+    let minx=Infinity,miny=Infinity,maxx=-Infinity,maxy=-Infinity;
+    for(const p of s.points){ if(p.x<minx)minx=p.x; if(p.y<miny)miny=p.y; if(p.x>maxx)maxx=p.x; if(p.y>maxy)maxy=p.y; }
+    return { x:minx, y:miny, w:maxx-minx, h:maxy-miny };
+  }
+  return null;
+}
+// ---------- 多选 / 框选 ----------
+let selectedIds = new Set();   // 当前选中的元素 id 集合（群组移动用）
+let dragGroup = null;          // 拖动中的群组 id 列表（null 表示单元素 dragEl）
+let marquee = null, marqueeing = false;  // 框选矩形（画布坐标）
+function drawSelBox(b){        // 选中高亮（虚线方框）
+  ctx.save(); ctx.strokeStyle = '#7ee787'; ctx.lineWidth = 2*dpr; ctx.setLineDash([6*dpr,4*dpr]);
+  ctx.strokeRect(b.x*dpr-3, b.y*dpr-3, b.w*dpr+6, b.h*dpr+6); ctx.restore();
+}
+function drawMarquee(m){       // 正在框选的半透明矩形
+  const x=Math.min(m.x0,m.x1), y=Math.min(m.y0,m.y1), w=Math.abs(m.x1-m.x0), h=Math.abs(m.y1-m.y0);
+  ctx.save(); ctx.fillStyle='rgba(126,231,135,0.12)'; ctx.strokeStyle='#7ee787'; ctx.lineWidth=1*dpr; ctx.setLineDash([4*dpr,3*dpr]);
+  ctx.fillRect(x*dpr,y*dpr,w*dpr,h*dpr); ctx.strokeRect(x*dpr,y*dpr,w*dpr,h*dpr); ctx.restore();
+}
+function selectAll(){ selectedIds = new Set(strokes.filter(s=>s&&s.id!=null).map(s=>s.id)); redraw(); }
+function clearSelect(){ selectedIds = new Set(); redraw(); }
+
 // ---------- 指针交互 ----------
 let drawing = false, current = null, tool = 'pen', color = '#f78c6c', width = 4, fill = false;
 let dragging = false, dragEl = null, startX = 0, startY = 0, lastX = 0, lastY = 0;
 function pos(e){ const r = cv.getBoundingClientRect(); return { x:e.clientX-r.left, y:e.clientY-r.top, p:(typeof e.pressure==='number' ? e.pressure : 0.5) }; }
 cv.addEventListener('pointerdown', e=>{
   const p = pos(e);
+  if(tool === 'marquee'){
+    marquee = { x0:p.x, y0:p.y, x1:p.x, y1:p.y }; marqueeing = true; cv.setPointerCapture(e.pointerId); return;
+  }
   if(tool === 'select'){
     const hit = hitTest(p.x, p.y);
-    if(hit){ dragging = true; dragEl = hit; startX = lastX = p.x; startY = lastY = p.y; cv.setPointerCapture(e.pointerId); }
-    return;
+    if(hit){
+      if(selectedIds.size > 0 && selectedIds.has(hit.id)) dragGroup = [...selectedIds];   // 拖动整组
+      else { selectedIds = new Set([hit.id]); dragEl = hit; dragGroup = null; }
+      dragging = true; startX = lastX = p.x; startY = lastY = p.y; cv.setPointerCapture(e.pointerId);
+    } else { selectedIds = new Set(); dragEl = null; dragGroup = null; }   // 空白点击清空选择
+    redraw(); return;
   }
   drawing = true; cv.setPointerCapture(e.pointerId);
   current = { tool, color, width, erase: tool==='eraser', fill, points:[p] };
@@ -280,13 +335,15 @@ cv.addEventListener('pointermove', e=>{
     const now = performance.now();
     if(now - lastCursor > 30){ lastCursor = now; send({ type:'cursor', id:myId, color:myColor, x:p.x, y:p.y }); }
   }
-  // 选择模式下拖动已命中的元素（实时预览，松手才发一次总位移）
-  if(dragging && dragEl){
+  // 框选：拖动更新矩形
+  if(marqueeing && marquee){ const p = pos(e); marquee.x1 = p.x; marquee.y1 = p.y; redraw(); return; }
+  // 选择模式下拖动（单元素或整组，实时预览，松手才发一次总位移）
+  if(dragging){
     const p = pos(e);
     const dx = p.x - lastX, dy = p.y - lastY;
-    translateLocal(dragEl, dx, dy);
-    lastX = p.x; lastY = p.y; redraw();
-    return;
+    if(dragGroup){ for(const s of strokes){ if(s && dragGroup.includes(s.id)) translateLocal(s, dx, dy); } }
+    else if(dragEl){ translateLocal(dragEl, dx, dy); }
+    lastX = p.x; lastY = p.y; redraw(); return;
   }
   if(!drawing) return;
   const p2 = pos(e);
@@ -295,11 +352,25 @@ cv.addEventListener('pointermove', e=>{
   redraw();
 });
 cv.addEventListener('pointerup', ()=>{
-  if(dragging && dragEl){
+  if(marqueeing && marquee){
+    marqueeing = false;
+    const rx=Math.min(marquee.x0,marquee.x1), ry=Math.min(marquee.y0,marquee.y1);
+    const rw=Math.abs(marquee.x1-marquee.x0), rh=Math.abs(marquee.y1-marquee.y0);
+    const sel = new Set();
+    if(rw>2 || rh>2){   // 拖出有效矩形才视为框选
+      for(const s of strokes){ const b = bboxOf(s); if(!b) continue;
+        if(!(rx+rw < b.x || rx > b.x+b.w || ry+rh < b.y || ry > b.y+b.h)) sel.add(s.id); }
+    }
+    selectedIds = sel; marquee = null; redraw(); return;
+  }
+  if(dragging){
     dragging = false;
     const tdx = lastX - startX, tdy = lastY - startY;
-    if(tdx !== 0 || tdy !== 0) send({ type:'move', id: dragEl.id, dx: tdx, dy: tdy });
-    dragEl = null; redraw(); return;
+    if(tdx !== 0 || tdy !== 0){
+      if(dragGroup && dragGroup.length) send({ type:'move', ids: dragGroup, dx: tdx, dy: tdy });
+      else if(dragEl) send({ type:'move', id: dragEl.id, dx: tdx, dy: tdy });
+    }
+    dragEl = null; dragGroup = null; redraw(); return;
   }
   if(!drawing) return; drawing = false;
   if(current && current.tool === 'text'){
@@ -334,12 +405,43 @@ $('color').oninput = e=> color = e.target.value;
 $('width').oninput = e=>{ width=+e.target.value; $('wVal').textContent=width; };
 $('fill').onchange = e=> fill = e.target.checked;
 $('clear').onclick = ()=>{ strokes=[]; current=null; history=[[]]; hptr=0; redraw(); send({type:'clear'}); };
+$('selAll').onclick = selectAll;
+$('selNone').onclick = clearSelect;
 $('undo').onclick = undo;
 $('redo').onclick = redo;
 $('join').onclick = ()=>{ manualLeave = true; clearTimeout(reconnectTimer); const v=$('room').value.trim()||'main'; location.search='?room='+encodeURIComponent(v); };
 $('save').onclick = ()=>{
   const a=document.createElement('a'); a.download='collabboard.png'; a.href=cv.toDataURL('image/png'); a.click();
 };
+$('saveSvg').onclick = ()=>{
+  const W = Math.round(cv.width / dpr), H = Math.round(cv.height / dpr);
+  const svg = (typeof strokesToSVG === 'function')
+    ? strokesToSVG(strokes, W, H)
+    : '<svg xmlns="http://www.w3.org/2000/svg"></svg>';
+  downloadBlob('collabboard.svg', new Blob([svg], { type: 'image/svg+xml' }));
+};
+// ---------- 插入图片（文件选择 / 剪贴板粘贴）----------
+$('imgBtn').onclick = ()=> $('imgInput').click();
+$('imgInput').onchange = e=>{ const f = e.target.files && e.target.files[0]; if(!f) return; const r = new FileReader(); r.onload = ()=> insertImage(r.result); r.readAsDataURL(f); e.target.value=''; };
+window.addEventListener('paste', e=>{
+  const item = [...(e.clipboardData ? e.clipboardData.items : [])].find(i => i.type && i.type.indexOf('image/') === 0);
+  if(!item) return;
+  const f = item.getAsFile(); if(!f) return;
+  const r = new FileReader(); r.onload = ()=> insertImage(r.result); r.readAsDataURL(f);
+});
+function insertImage(src){
+  const im = new Image();
+  im.onload = ()=>{
+    const maxW = 320, maxH = 240;
+    let w = im.naturalWidth || 160, h = im.naturalHeight || 120;
+    const sc = Math.min(maxW/w, maxH/h, 1);
+    w = Math.round(w*sc); h = Math.round(h*sc);
+    const el = { type:'image', id: myId + ':' + (++localSeq), x:40, y:40, w, h, src, author:myId, authorColor:myColor };
+    strokes.push(el); snapshot(); redraw();
+    send({ type:'image', x:40, y:40, w, h, src });
+  };
+  im.src = src;
+}
 $('copy').onclick = async ()=>{
   try{ await navigator.clipboard.writeText(location.href); $('copy').textContent='已复制 ✓'; setTimeout(()=>$('copy').textContent='复制邀请链接',1500);}catch(e){}
 };
@@ -352,6 +454,7 @@ $('export').onclick = ()=>{
 window.addEventListener('keydown', e=>{
   if(e.ctrlKey && (e.key==='z'||e.key==='Z') && !e.shiftKey){ e.preventDefault(); undo(); }
   else if(e.ctrlKey && (e.key==='y'||e.key==='Y' || (e.shiftKey && (e.key==='z'||e.key==='Z')))){ e.preventDefault(); redo(); }
+  else if(e.key==='Escape'){ clearSelect(); }   // Esc 取消选择
 });
 
 function undo(){ send({type:'undo'}); }     // 撤销/重做改为服务端权威快照栈，跨端同步
@@ -453,12 +556,15 @@ function connect(){
         strokes.push(m.stroke); history = history.slice(0,hptr+1); history.push(clone(strokes)); hptr++; redraw(); break;
       case 'text':
         strokes.push(m); history = history.slice(0,hptr+1); history.push(clone(strokes)); hptr++; redraw(); break;
+      case 'image':
+        strokes.push(m); history = history.slice(0,hptr+1); history.push(clone(strokes)); hptr++; redraw(); break;
       case 'move':
-        {
-          const el = strokes.find(s => s && s.id === m.id);
-          if(el){ translateLocal(el, m.dx, m.dy); redraw(); }
+        if(Array.isArray(m.ids)){
+          for(const id of m.ids){ const el = strokes.find(s => s && s.id === id); if(el) translateLocal(el, m.dx, m.dy); }
+        } else if(m.id != null){
+          const el = strokes.find(s => s && s.id === m.id); if(el) translateLocal(el, m.dx, m.dy);
         }
-        break;
+        redraw(); break;
       case 'replace':
         strokes = clone(m.strokes||[]); history=[clone(strokes)]; hptr=0; redraw(); break;
       case 'clear':

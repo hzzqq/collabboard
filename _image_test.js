@@ -1,5 +1,5 @@
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 8090;
-// CollabBoard 端到端测试：验证 text 消息广播 + 房间快照包含文字；并对 index.html 内联脚本做语法检查。
+// CollabBoard 端到端测试：验证 image（图片元素）—— 服务端接收 base64 图片、分配 id、广播、快照落库。
 const net = require('net');
 const crypto = require('crypto');
 const fs = require('fs');
@@ -8,6 +8,9 @@ const { execSync } = require('child_process');
 const NODE = 'C:/Users/Administrator/.workbuddy/binaries/node/versions/22.22.2/node.exe';
 
 const dir = __dirname;
+// 清洁 rooms/ 防止历史落盘文件跨运行污染（经验沉淀：用唯一房间名 + 启动清盘）
+try { fs.rmSync(path.join(dir, 'rooms'), { recursive: true, force: true }); } catch(e){}
+const ROOM = 'imgR_' + crypto.randomBytes(3).toString('hex');
 let fail = 0, pass = 0;
 const ok = (n, c)=> c ? pass++ : (fail++, console.log('  FAIL', n));
 
@@ -16,7 +19,7 @@ const html = fs.readFileSync(path.join(dir, 'index.html'), 'utf8');
 const m = html.match(/<script>([\s\S]*?)<\/script>/);
 ok('index.html 含内联脚本', !!m);
 if(m){
-  const tmp = path.join(dir, '.wb_inline_check.js');
+  const tmp = path.join(dir, '.wb_img_inline.js');
   fs.writeFileSync(tmp, m[1]);
   try { execSync(`"${NODE}" --check "${tmp}"`); ok('内联脚本语法 OK', true); }
   catch(e){ ok('内联脚本语法 OK', false); console.log(e.stdout?.toString(), e.stderr?.toString()); }
@@ -74,31 +77,38 @@ function connect(room){
 }
 
 (async ()=>{
-  // 等服务端就绪
   await new Promise(r=> server.stdout.on('data', d=>{ if(/WS 服务已启动/.test(d.toString())) r(); }));
   await sleep(150);
-  const c1 = await connect('roomT');
-  const c2 = await connect('roomT');
+  const c1 = await connect(ROOM);
+  const c2 = await connect(ROOM);
   await sleep(300);
-  let gotText=null, gotStroke=null;
-  c2.onmsg = msg=>{ if(msg.type==='text') gotText=msg; if(msg.type==='stroke') gotStroke=msg; };
-  // 文字广播
-  c1.send({ type:'text', text:'hello board', x:10, y:20, color:'#ffffff', width:16 });
-  await sleep(250);
-  ok('text 被对端收到', gotText && gotText.text==='hello board' && gotText.x===10);
-  // 矢量笔画仍正常广播
-  c1.send({ type:'stroke', stroke:{ tool:'rect', color:'#f00', width:3, fill:true, points:[{x:1,y:1},{x:5,y:5}] } });
-  await sleep(250);
-  ok('stroke 仍被广播', gotStroke && gotStroke.stroke && gotStroke.stroke.tool==='rect');
-  // 房间快照包含文字（再连一个客户端应收到含 text 的 snapshot）
-  const c3 = await connect('roomT');
-  let snapHasText=false;
-  c3.onmsg = msg=>{ if(msg.type==='snapshot' && Array.isArray(msg.strokes)){ if(msg.strokes.some(s=>s.type==='text' && s.text==='hello board')) snapHasText=true; } };
+
+  let gotImg = null;
+  c2.onmsg = msg=>{ if(msg.type==='image') gotImg = msg; };
+
+  const SRC = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAACN/1+hAAAAEUlEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=';
+  // c1 插入一张图片（服务端分配 id，限宽高）
+  c1.send({ type:'image', src: SRC, x: 40, y: 60, w: 200, h: 150 });
+  await sleep(300);
+
+  ok('c2 收到 image 广播', gotImg && gotImg.type === 'image');
+  ok('image 含服务端分配 id', gotImg && gotImg.id != null);
+  ok('image src 正确', gotImg && gotImg.src === SRC);
+  ok('image 坐标正确', gotImg && gotImg.x === 40 && gotImg.y === 60);
+  ok('image 宽高被采用', gotImg && gotImg.w === 200 && gotImg.h === 150);
+  ok('image 带服务端权威署名', gotImg && typeof gotImg.author === 'string' && gotImg.author.length > 0 && gotImg.authorColor);
+
+  // 第三客户端快照应含该图片
+  const c3 = await connect(ROOM);
+  let snap = null;
+  c3.onmsg = msg=>{ if(msg.type==='snapshot' && Array.isArray(msg.strokes)) snap = msg; };
   await sleep(400);
-  if(!snapHasText) snapHasText = (c3.msgs||[]).some(mm=> mm.type==='snapshot' && Array.isArray(mm.strokes) && mm.strokes.some(s=>s.type==='text'&&s.text==='hello board'));
-  ok('snapshot 含文字标注', snapHasText);
+  if(!snap) snap = (c3.msgs||[]).find(mm=> mm.type==='snapshot' && Array.isArray(mm.strokes));
+  const img = snap && snap.strokes.find(s=> s.type === 'image');
+  ok('快照含 image 元素', img && img.src === SRC && img.id === gotImg.id);
+  ok('快照 image 宽高保留', img && img.w === 200 && img.h === 150);
 
   server.kill();
-  console.log(`\n[CollabBoard text] pass=${pass} fail=${fail}`);
+  console.log(`\n[CollabBoard image] pass=${pass} fail=${fail}`);
   process.exit(fail?1:0);
 })().catch(e=>{ console.error(e); server.kill(); process.exit(1); });

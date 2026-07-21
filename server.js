@@ -122,7 +122,7 @@ function handleData(sock, buf, room){
         try{
           let obj = JSON.parse(msg);
           // 房间锁定时，非房主的编辑类操作被拒绝（仅回错误给发起者，不广播、不入栈）
-          const EDIT_OPS = new Set(['stroke','text','move','replace','clear','undo','redo']);
+          const EDIT_OPS = new Set(['stroke','text','image','move','replace','clear','undo','redo']);
           if(EDIT_OPS.has(obj.type) && room.locked && sock._cid !== room.owner){
             sendFrame(sock, JSON.stringify({ type:'error', code:'locked', msg:'房间已锁定，仅房主可编辑' }));
             obj = { type:'__noop__' };
@@ -146,18 +146,36 @@ function handleData(sock, buf, room){
               store.saveRoom(room.name, room);
             }
             break;
+          case 'image':
+            if(typeof obj.src !== 'string' || !obj.src) break;
+            {
+              const img = { type:'image', id: obj.id != null ? obj.id : (sock._cid + ':' + (++strokeSeq)),
+                x: +obj.x||0, y: +obj.y||0,
+                w: Math.max(8, Math.min(1024, +obj.w||160)),
+                h: Math.max(8, Math.min(1024, +obj.h||120)),
+                src: obj.src.slice(0, 4000000),   // 限制 base64 体积（~3MB）
+                author: sock._cid, authorColor: sock.color };
+              hist.commitStrokes(room, room.strokes.concat(img));
+              broadcast(room, JSON.stringify(img), sock);
+              store.saveRoom(room.name, room);
+            }
+            break;
           case 'move':
             {
-              const id = obj.id, dx = +obj.dx||0, dy = +obj.dy||0;
-              if(id == null || (dx === 0 && dy === 0)) break;
+              const dx = +obj.dx||0, dy = +obj.dy||0;
+              const ids = (obj.ids && Array.isArray(obj.ids)) ? obj.ids
+                        : (obj.id != null ? [obj.id] : null);
+              if(!ids || ids.length === 0 || (dx === 0 && dy === 0)) break;
               let found = false;
               const moved = room.strokes.map(el => {
-                if(el && el.id === id){ found = true; return translateElement(el, dx, dy); }
+                if(el && ids.includes(el.id)){ found = true; return translateElement(el, dx, dy); }
                 return el;
               });
-              if(!found) break;                         // 没找到该 id 直接忽略
+              if(!found) break;                         // 没找到任何 id 直接忽略
               hist.commitStrokes(room, moved);          // 进入撤销栈，支持 Ctrl+Z
-              broadcast(room, JSON.stringify({ type:'move', id, dx, dy }), sock);  // 对端按 delta 平移
+              // 单 id 移动沿用 {id} 字段以兼容旧客户端；群组移动用 {ids} 数组
+              const out = (obj.ids && Array.isArray(obj.ids)) ? { type:'move', ids, dx, dy } : { type:'move', id: obj.id, dx, dy };
+              broadcast(room, JSON.stringify(out), sock);  // 对端按 delta 平移
               store.saveRoom(room.name, room);
             }
             break;

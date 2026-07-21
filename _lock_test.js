@@ -1,3 +1,4 @@
+const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 8090;
 // CollabBoard 端到端测试：验证房间锁定（房主锁定后非房主编辑被拒，房主仍可编辑；非房主不可锁定）。
 const net = require('net');
 const crypto = require('crypto');
@@ -21,7 +22,7 @@ if(m){
   fs.unlinkSync(tmp);
 }
 
-const server = require('child_process').spawn(NODE, ['server.js'], { cwd: dir, env: { ...process.env, HB: '5000' } });
+const server = require('child_process').spawn(NODE, ['server.js'], { cwd: dir, env: { ...process.env, PORT: String(PORT), HB: '5000' } });
 function sleep(ms){ return new Promise(r=> setTimeout(r, ms)); }
 class WS {
   constructor(sock){ this.sock=sock; this.buf=Buffer.alloc(0); this.handshake=false; this.onmsg=null; this.msgs=[]; this._cid=null; }
@@ -54,7 +55,7 @@ class WS {
 }
 function connect(room){
   return new Promise((res, rej)=>{
-    const sock=net.connect(8080,'localhost');
+    const sock=net.connect(PORT,'localhost');
     const key=crypto.randomBytes(16).toString('base64');
     const ws=new WS(sock);
     sock.on('connect', ()=> sock.write(

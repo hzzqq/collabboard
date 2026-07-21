@@ -1,3 +1,4 @@
+const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 8090;
 // CollabBoard 画笔压感测试：笔画点携带 p(pressure)，服务端原样转发并在 snapshot 中保留。
 // 测试客户端做真正的 WebSocket 帧解析，避免多帧合并时只解析到最后一帧的竞态；
 // 房间名带随机后缀，避免 rooms/<name>.json 跨运行残留污染。
@@ -73,7 +74,7 @@ function wsSend(s, obj){
   const room = 'pr_' + Date.now().toString(36) + '_' + crypto.randomBytes(3).toString('hex');
   const port = await freePort();
   const server = spawn(process.execPath, [path.join(__dirname, 'server.js')],
-    { env: { ...process.env, HB: '999999', PORT: String(port) }, stdio: 'ignore' });
+    { env: { ...process.env, PORT: String(PORT), HB: '999999', PORT: String(port) }, stdio: 'ignore' });
   await new Promise(r => setTimeout(r, 700));
   try {
     const c1 = await wsConnect(room, port);

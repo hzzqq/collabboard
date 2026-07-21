@@ -1,3 +1,4 @@
+const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 8090;
 // CollabBoard 端到端测试：验证 move（拖拽移动）操作 —— 服务端按 id 平移元素并广播，快照落库。
 const net = require('net');
 const crypto = require('crypto');
@@ -23,7 +24,7 @@ if(m){
 }
 
 // 2) 启动服务端
-const server = require('child_process').spawn(NODE, ['server.js'], { cwd: dir, env: { ...process.env, HB: '5000' } });
+const server = require('child_process').spawn(NODE, ['server.js'], { cwd: dir, env: { ...process.env, PORT: String(PORT), HB: '5000' } });
 function sleep(ms){ return new Promise(r=> setTimeout(r, ms)); }
 
 class WS {
@@ -60,7 +61,7 @@ class WS {
 }
 function connect(room){
   return new Promise((res, rej)=>{
-    const sock=net.connect(8080,'localhost');
+    const sock=net.connect(PORT,'localhost');
     const key=crypto.randomBytes(16).toString('base64');
     const ws=new WS(sock);
     sock.on('connect', ()=> sock.write(

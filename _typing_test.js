@@ -1,3 +1,4 @@
+const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 8090;
 // CollabBoard 「正在输入」广播测试：c1 发送 typing，c2 应收到带 name/on 的 typing 消息。
 const { spawn } = require('child_process');
 const net = require('net');
@@ -9,7 +10,7 @@ function ok(name, cond){ if(cond) pass++; else { fail++; console.log('  FAIL', n
 
 function wsConnect(room){
   return new Promise((resolve, reject)=>{
-    const s = net.connect(8080, 'localhost');
+    const s = net.connect(PORT, 'localhost');
     const key = crypto.randomBytes(16).toString('base64');
     s.on('connect', ()=> s.write(
       'GET /?room=' + room + ' HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\n' +
@@ -35,7 +36,7 @@ function wsSend(s, obj){
 
 (async ()=>{
   const server = spawn(process.execPath, [path.join(__dirname, 'server.js')],
-    { env: { ...process.env, HB: '999999' }, stdio: 'ignore' });
+    { env: { ...process.env, PORT: String(PORT), HB: '999999' }, stdio: 'ignore' });
   await new Promise(r => setTimeout(r, 700));
   const got = [];
   try {

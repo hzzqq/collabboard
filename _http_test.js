@@ -1,3 +1,4 @@
+const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 8090;
 // CollabBoard HTTP 管理 API 测试：验证 /api/health /api/rooms /api/room 与 404 行为。
 // 先启动真实服务端，用原始 net 做 HTTP GET，并用最小 WS 客户端推一笔笔画后回查房间。
 const { spawn } = require('child_process');
@@ -10,7 +11,7 @@ function ok(name, cond){ if(cond) pass++; else { fail++; console.log('  FAIL', n
 
 function httpGet(p){
   return new Promise((resolve, reject)=>{
-    const s = net.connect(8080, 'localhost');
+    const s = net.connect(PORT, 'localhost');
     let buf = '';
     s.on('connect', ()=> s.write('GET ' + p + ' HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n'));
     s.on('data', d=> buf += d.toString('utf8'));
@@ -23,7 +24,7 @@ function httpGet(p){
 }
 function wsConnect(room){
   return new Promise((resolve, reject)=>{
-    const s = net.connect(8080, 'localhost');
+    const s = net.connect(PORT, 'localhost');
     const key = crypto.randomBytes(16).toString('base64');
     s.on('connect', ()=> s.write(
       'GET /?room=' + room + ' HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\n' +
@@ -47,7 +48,7 @@ function wsSend(s, obj){
 
 (async ()=>{
   const server = spawn(process.execPath, [path.join(__dirname, 'server.js')],
-    { env: { ...process.env, HB: '999999' }, stdio: 'ignore' });
+    { env: { ...process.env, PORT: String(PORT), HB: '999999' }, stdio: 'ignore' });
   await new Promise(r => setTimeout(r, 700));
 
   try {

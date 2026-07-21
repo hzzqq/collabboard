@@ -1,3 +1,4 @@
+const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 8090;
 // history.js 单元测试：commit/undo/redo 快照栈 + 清空 + 上限。
 const hist = require('./history');
 let pass = 0, fail = 0;

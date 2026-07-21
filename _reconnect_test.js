@@ -1,3 +1,4 @@
+const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 8090;
 // CollabBoard 断线重连测试：客户端断开后重连，服务端下发 snapshot 同步最新房间状态。
 // 全部笔画来自同一连接（顺序绘制后断开再重连），避免跨客户端时序竞态，结果确定。
 // 关键修正：
@@ -96,7 +97,7 @@ function waitSnapshot(s, index, timeoutMs){
   const room = 'rec_' + Date.now().toString(36) + '_' + crypto.randomBytes(3).toString('hex');
   const port = await freePort();
   const server = spawn(process.execPath, [path.join(__dirname, 'server.js')],
-    { env: { ...process.env, HB: '999999', PORT: String(port) }, stdio: 'ignore' });
+    { env: { ...process.env, PORT: String(PORT), HB: '999999', PORT: String(port) }, stdio: 'ignore' });
   await new Promise(r => setTimeout(r, 800));
   try {
     // 同一连接 c1 顺序画两笔（不同颜色做标记）
