@@ -82,12 +82,19 @@
       <button data-tool="marquee">▢ 框选</button>
       <button data-tool="pin">📍 标记</button>
       <button data-tool="laser">🔦 激光笔</button>
+      <button data-tool="comment">💬 评论</button>
+      <button data-tool="note">🟨 便签</button>
       <button id="imgBtn">🖼 插入图片</button>
       <button id="clear">清屏</button>
       <button id="selAll">☑ 全选</button>
       <button id="selNone">✕ 取消选择</button>
       <button id="dupBtn">⧉ 克隆选中</button>
       <button id="groupBtn">🔗 编组选中</button>
+      <button id="lockElBtn">🔒 锁定选中</button>
+      <button id="unlockElBtn">🔓 解锁选中</button>
+      <label style="margin-top:8px;font-size:11px;color:#6b7888;">板背景(房主)</label>
+      <input type="color" id="bgColor" value="#0e1118" />
+      <button id="setBgBtn">🎨 设为背景</button>
       <button id="ungroupBtn">🔓 解组选中</button>
       <button id="pingBtn">🔔 提醒选中</button>
     </div>
@@ -171,6 +178,7 @@
       <div style="font-size:11px;color:#6b7888;margin-top:6px;">房主：<span id="ownerName">—</span></div>
       <div class="tools" style="margin-top:6px;">
         <button id="transferBtn">🤝 转让房主</button>
+        <button id="kickBtn">🚪 踢出用户</button>
       </div>
     </div>
     <div class="row"><button id="save">保存 PNG</button></div>
@@ -303,7 +311,55 @@ function drawStroke(s){
     ctx.lineTo(x1 - hl*Math.cos(ang + Math.PI/7), y1 - hl*Math.sin(ang + Math.PI/7));
     ctx.stroke();
   }
+  // 评论徽标：元素带评论时在左上角画 💬n 角标
+  if(s.comments && s.comments.length){
+    let ax, ay;
+    if(s.type === 'text' || s.type === 'image'){ ax = s.x; ay = s.y; }
+    else if(Array.isArray(s.points) && s.points.length){
+      let mnx=Infinity, mny=Infinity;
+      for(const q of s.points){ if(q.x<mnx)mnx=q.x; if(q.y<mny)mny=q.y; }
+      ax=mnx; ay=mny;
+    }
+    if(ax !== undefined){
+      ctx.font = (11*dpr)+'px sans-serif';
+      const label = '💬' + s.comments.length;
+      const w = ctx.measureText(label).width + 6*dpr;
+      ctx.fillStyle = '#0c0f14'; ctx.fillRect((ax-2)*dpr, (ay-15)*dpr, w, 15*dpr);
+      ctx.fillStyle = '#ffd24a'; ctx.textBaseline = 'top'; ctx.fillText(label, (ax)*dpr, (ay-14)*dpr);
+    }
+  }
+  // 便签：彩色卡片 + 文字（左上角对齐 x/y）
+  if(s.type === 'note'){
+    const x = (s.x||0)*dpr, y = (s.y||0)*dpr, w = (s.w||160)*dpr, h = (s.h||120)*dpr;
+    ctx.fillStyle = s.color || '#ffe066';
+    roundRect(ctx, x, y, w, h, 8*dpr); ctx.fill();
+    ctx.strokeStyle = 'rgba(0,0,0,0.25)'; ctx.lineWidth = 1*dpr; ctx.stroke();
+    ctx.fillStyle = '#1a1a1a'; ctx.textBaseline = 'top';
+    ctx.font = (13*dpr)+'px sans-serif';
+    const tw = Math.max(0, w - 12*dpr), th = Math.max(0, h - 10*dpr);
+    wrapText(ctx, (s.text||'').toString(), x + 6*dpr, y + 5*dpr, tw, 16*dpr, th);
+  }
   ctx.restore();
+}
+function roundRect(ctx, x, y, w, h, r){
+  ctx.beginPath();
+  ctx.moveTo(x+r, y);
+  ctx.arcTo(x+w, y,   x+w, y+h, r);
+  ctx.arcTo(x+w, y+h, x,   y+h, r);
+  ctx.arcTo(x,   y+h, x,   y,   r);
+  ctx.arcTo(x,   y,   x+w, y,   r);
+  ctx.closePath();
+}
+function wrapText(ctx, text, x, y, maxW, lh, maxH){
+  const words = String(text).split(/\s+/).filter(Boolean);
+  if(!words.length){ ctx.fillText('', x, y); return; }
+  let line = '', yy = y;
+  for(const wd of words){
+    const test = line ? line + ' ' + wd : wd;
+    if(ctx.measureText(test).width > maxW && line){ ctx.fillText(line, x, yy); line = wd; yy += lh; if(yy > y + maxH - lh) break; }
+    else line = test;
+  }
+  if(line && yy <= y + maxH - lh) ctx.fillText(line, x, yy);
 }
 function redraw(){
   ctx.clearRect(0,0,cv.width,cv.height);
@@ -314,6 +370,8 @@ function redraw(){
     ctx.restore();
   }
   for(const s of strokes) drawStroke(s);
+  // 元素锁标记：被锁定的元素在左上角画黄色小锁，提示仅房主可编辑
+  for(const s of strokes) if(s.locked){ const b = bboxOf(s); if(b){ const cx = b.x*dpr, cy = b.y*dpr; ctx.save(); ctx.fillStyle = '#ffc400'; ctx.beginPath(); ctx.arc(cx, cy, 7*dpr, 0, Math.PI*2); ctx.fill(); ctx.strokeStyle = '#0c0f14'; ctx.lineWidth = 2*dpr; ctx.beginPath(); ctx.arc(cx, cy - 1*dpr, 3*dpr, Math.PI, 2*Math.PI); ctx.stroke(); ctx.fillStyle = '#0c0f14'; ctx.fillRect(cx - 3*dpr, cy, 6*dpr, 5*dpr); ctx.restore(); } }
   for(const s of strokes) if(selectedIds.has(s.id)){ const b = bboxOf(s); if(b) drawSelBox(b); }
   // 协作者的选区：以协作者颜色虚线框显示（在场感知）
   for(const [, sel] of remoteSelections){
@@ -454,8 +512,8 @@ function drawMarquee(m){       // 正在框选的半透明矩形
   ctx.save(); ctx.fillStyle='rgba(126,231,135,0.12)'; ctx.strokeStyle='#7ee787'; ctx.lineWidth=1*dpr; ctx.setLineDash([4*dpr,3*dpr]);
   ctx.fillRect(x*dpr,y*dpr,w*dpr,h*dpr); ctx.strokeRect(x*dpr,y*dpr,w*dpr,h*dpr); ctx.restore();
 }
-function selectAll(){ selectedIds = new Set(strokes.filter(s=>s&&s.id!=null).map(s=>s.id)); redraw(); }
-function clearSelect(){ selectedIds = new Set(); redraw(); }
+function selectAll(){ selectedIds = new Set(strokes.filter(s=>s&&s.id!=null).map(s=>s.id)); redraw(); updateLockUI(); }
+function clearSelect(){ selectedIds = new Set(); redraw(); updateLockUI(); }
 
 // ---------- 指针交互 ----------
 let drawing = false, current = null, tool = 'pen', color = '#f78c6c', width = 4, fill = false, snOn = false, gridSize = 20;
@@ -468,6 +526,33 @@ cv.addEventListener('pointerdown', e=>{
   if(tool === 'pin'){
     const pin = { type:'pin', id: myId + ':' + (++localSeq), x: p.x, y: p.y, label: '', author: myId, authorColor: myColor };
     strokes.push(pin); snapshot(); send({ type:'pin', pin });
+    return;
+  }
+  if(tool === 'comment'){
+    const hit = hitTest(p.x, p.y);
+    if(hit){
+      const text = (typeof prompt === 'function') ? prompt('输入对选中元素的评论：') : null;
+      if(text && text.trim()){
+        if(!Array.isArray(hit.comments)) hit.comments = [];
+        hit.comments.push({ author: myId, authorColor: myColor, text: text.trim().slice(0,200), ts: Date.now() });
+        send({ type:'comment', id: hit.id, text: text.trim() });
+        redraw();
+      }
+    } else {
+      addChat('提示：评论工具请点击画布上已有的元素', '', true);
+    }
+    return;
+  }
+  if(tool === 'note'){
+    const text = (typeof prompt === 'function') ? prompt('输入便签内容：') : null;
+    if(text && text.trim()){
+      const palette = ['#ffe066','#ffd1dc','#c9f7c9','#c9e7ff','#e6d6ff'];
+      const color = palette[Math.floor(Math.random()*palette.length)];
+      const note = { type:'note', x: Math.round(p.x), y: Math.round(p.y), w: 160, h: 120, text: text.trim(), color };
+      send(note);
+      strokes.push(note);   // 乐观本地渲染（服务端会回署名/落库）
+      redraw();
+    }
     return;
   }
   if(tool === 'marquee'){
@@ -531,7 +616,7 @@ cv.addEventListener('pointerup', ()=>{
       for(const s of strokes){ const b = bboxOf(s); if(!b) continue;
         if(!(rx+rw < b.x || rx > b.x+b.w || ry+rh < b.y || ry > b.y+b.h)) sel.add(s.id); }
     }
-    selectedIds = sel; marquee = null; redraw(); return;
+    selectedIds = sel; marquee = null; redraw(); updateLockUI(); return;
   }
   if(dragging){
     dragging = false;
@@ -602,6 +687,9 @@ function duplicateSel(){ if(selectedIds.size === 0) return; send({ type:'duplica
 $('dupBtn').onclick = duplicateSel;
 function groupSel(){ if(selectedIds.size === 0) return; const gid = myId + ':g' + (++localSeq); send({ type:'group', ids:[...selectedIds], group: gid }); for(const s of strokes){ if(s && selectedIds.has(s.id)) s.group = gid; } redraw(); }
 $('groupBtn').onclick = groupSel;
+$('lockElBtn').onclick = lockSel;
+$('unlockElBtn').onclick = unlockSel;
+$('setBgBtn').onclick = ()=> send({ type:'set_bg', color: $('bgColor').value });
 function ungroupSel(){ if(selectedIds.size === 0) return; send({ type:'ungroup', ids:[...selectedIds] }); for(const s of strokes){ if(s && selectedIds.has(s.id)) delete s.group; } redraw(); }
 $('ungroupBtn').onclick = ungroupSel;
 $('pingBtn').onclick = pingSel;
@@ -616,6 +704,8 @@ function rotateSel(deg){ if(selectedIds.size === 0) return; send({ type:'rotate'
 $('rotL').onclick = ()=> rotateSel(-90);
 $('rotR').onclick = ()=> rotateSel(90);
 function deleteSel(){ if(selectedIds.size === 0) return; send({ type:'delete', ids:[...selectedIds] }); }
+function lockSel(){ if(selectedIds.size === 0) return; send({ type:'lock_element', ids:[...selectedIds] }); }
+function unlockSel(){ if(selectedIds.size === 0) return; send({ type:'unlock_element', ids:[...selectedIds] }); }
 $('delSelBtn').onclick = deleteSel;
 $('undo').onclick = undo;
 $('redo').onclick = redo;
@@ -768,8 +858,15 @@ function connect(){
         strokes.push(m); history = history.slice(0,hptr+1); history.push(clone(strokes)); hptr++; redraw(); break;
       case 'image':
         strokes.push(m); history = history.slice(0,hptr+1); history.push(clone(strokes)); hptr++; redraw(); break;
+      case 'note':
+        strokes.push(m); history = history.slice(0,hptr+1); history.push(clone(strokes)); hptr++; redraw(); break;
       case 'pin':
         strokes.push(m); history = history.slice(0,hptr+1); history.push(clone(strokes)); hptr++; redraw(); break;
+      case 'comment': {
+        const el = strokes.find(s => s && s.id === m.id);
+        if(el){ if(!Array.isArray(el.comments)) el.comments = []; el.comments.push(m.comment); redraw(); }
+        break;
+      }
       case 'move':
         if(Array.isArray(m.ids)){
           for(const id of m.ids){ const el = strokes.find(s => s && s.id === id); if(el) translateLocal(el, m.dx, m.dy); }
@@ -830,8 +927,20 @@ function connect(){
         roomLocked = !!m.locked; updateLockUI();
         addChat(m.locked ? '房间已被锁定，仅房主可编辑' : '房间已解锁', '', true);
         break;
+      case 'lock_element':
+        for(const id of (m.ids || [])){ const el = strokes.find(s => s && s.id === id); if(el) el.locked = !!m.locked; }
+        redraw();
+        addChat(m.locked ? '🔒 有元素被房主锁定(仅房主可编辑)' : '🔓 元素已解锁', '', true);
+        break;
+      case 'bg':
+        if(cv) cv.style.background = m.color || '#0e1118';
+        break;
       case 'error':
         addChat('⚠ ' + (m.msg || '操作被拒绝'), '', true); break;
+      case 'kicked':
+        addChat('⚠ 你已被房主移出房间', '', true);
+        try { ws.close(); } catch(e){}
+        break;
     }
   };
 }
@@ -847,9 +956,22 @@ function updateLockUI(){
   $('unlockBtn').style.opacity = (!me || !roomLocked) ? .45 : 1;
   $('transferBtn').disabled = !me;
   $('transferBtn').style.opacity = !me ? .45 : 1;
+  $('kickBtn').disabled = !me;
+  $('kickBtn').style.opacity = !me ? .45 : 1;
+  $('lockElBtn').disabled = !me || selectedIds.size === 0;
+  $('lockElBtn').style.opacity = (!me || selectedIds.size === 0) ? .45 : 1;
+  $('unlockElBtn').disabled = !me || selectedIds.size === 0;
+  $('unlockElBtn').style.opacity = (!me || selectedIds.size === 0) ? .45 : 1;
+  $('setBgBtn').disabled = !me;
+  $('setBgBtn').style.opacity = me ? 1 : .45;
 }
 $('lockBtn').onclick = ()=> send({ type:'lock' });
 $('unlockBtn').onclick = ()=> send({ type:'unlock' });
+$('kickBtn').onclick = ()=>{
+  if(roomOwner !== myId){ addChat('⚠ 只有房主可以踢人', '', true); return; }
+  const toId = (typeof prompt === 'function') ? prompt('输入要踢出的用户 ID（可在成员列表中查看）：') : null;
+  if(toId && toId.trim()) send({ type:'kick', toId: toId.trim() });
+};
 $('transferBtn').onclick = ()=>{
   if(roomOwner !== myId){ addChat('⚠ 只有房主可以转让', '', true); return; }
   const toId = (typeof prompt === 'function') ? prompt('输入要转让房主的用户 ID：') : null;

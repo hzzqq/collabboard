@@ -20,7 +20,7 @@ const rooms = new Map();
 function getRoom(name){
   let r = rooms.get(name);
   if(!r){
-    r = { clients: new Set(), strokes: [], chats: [], name, owner: null, locked: false };
+    r = { clients: new Set(), strokes: [], chats: [], name, owner: null, locked: false, lockedElements: new Set(), bg: null };
     const saved = store.loadRoom(name);
     if(saved){ r.strokes = saved.strokes; r.chats = saved.chats; }
     rooms.set(name, r);
@@ -141,10 +141,19 @@ function handleData(sock, buf, room){
         try{
           let obj = JSON.parse(msg);
           // 房间锁定时，非房主的编辑类操作被拒绝（仅回错误给发起者，不广播、不入栈）
-          const EDIT_OPS = new Set(['stroke','text','image','move','replace','clear','undo','redo','duplicate','rotate','delete','pin','group','ungroup','align']);
-          if(EDIT_OPS.has(obj.type) && room.locked && sock._cid !== room.owner){
-            sendFrame(sock, JSON.stringify({ type:'error', code:'locked', msg:'房间已锁定，仅房主可编辑' }));
-            obj = { type:'__noop__' };
+          const EDIT_OPS = new Set(['stroke','text','image','note','move','replace','clear','undo','redo','duplicate','rotate','delete','pin','group','ungroup','align','comment']);
+          if(EDIT_OPS.has(obj.type)){
+            if(room.locked && sock._cid !== room.owner){
+              sendFrame(sock, JSON.stringify({ type:'error', code:'locked', msg:'房间已锁定，仅房主可编辑' }));
+              obj = { type:'__noop__' };
+            } else {
+              // 元素级锁定：目标元素(支持 obj.id 或 obj.ids)被锁且非房主 → 拒绝(房间锁与元素锁独立)
+              const tids = obj.id != null ? [obj.id] : (Array.isArray(obj.ids) ? obj.ids : (obj.stroke && obj.stroke.id != null ? [obj.stroke.id] : null));
+              if(tids && tids.some(id => room.lockedElements.has(id)) && sock._cid !== room.owner){
+                sendFrame(sock, JSON.stringify({ type:'error', code:'element_locked', msg:'该元素已被锁定，仅房主可编辑' }));
+                obj = { type:'__noop__' };
+              }
+            }
           }
           switch(obj.type){
           case 'stroke':
@@ -197,6 +206,21 @@ function handleData(sock, buf, room){
               store.saveRoom(room.name, room);
             }
             break;
+          case 'note':
+            if(typeof obj.text !== 'string' || !obj.text.trim()) break;
+            {
+              const note = { type:'note', id: obj.id != null ? obj.id : (sock._cid + ':' + (++strokeSeq)),
+                x: +obj.x||0, y: +obj.y||0,
+                w: Math.max(40, Math.min(640, +obj.w||160)),
+                h: Math.max(30, Math.min(480, +obj.h||120)),
+                text: obj.text.slice(0, 280).trim(),
+                color: (typeof obj.color === 'string' && /^#[0-9a-fA-F]{6}$/.test(obj.color)) ? obj.color : '#ffe066',
+                author: sock._cid, authorColor: sock.color };
+              hist.commitStrokes(room, room.strokes.concat(note));
+              broadcast(room, JSON.stringify(note), sock);
+              store.saveRoom(room.name, room);
+            }
+            break;
           case 'pin':
             if(obj.x == null || obj.y == null) break;
             {
@@ -206,6 +230,19 @@ function handleData(sock, buf, room){
                 author: sock._cid, authorColor: sock.color };
               hist.commitStrokes(room, room.strokes.concat(pin));
               broadcast(room, JSON.stringify(pin), sock);
+              store.saveRoom(room.name, room);
+            }
+            break;
+          case 'comment':
+            if(typeof obj.id !== 'string' || !obj.id) break;
+            if(typeof obj.text !== 'string' || !obj.text.trim()) break;
+            {
+              const el = room.strokes.find(s => s && s.id === obj.id);
+              if(!el){ sendFrame(sock, JSON.stringify({ type:'error', code:'no_such_element', msg:'评论的元素不存在' })); break; }
+              const comment = { author: sock._cid, authorColor: sock.color, text: obj.text.slice(0,200).trim(), ts: Date.now() };
+              if(!Array.isArray(el.comments)) el.comments = [];
+              el.comments.push(comment);                         // el 是 room.strokes 中元素的引用，原地追加即可持久化
+              broadcast(room, JSON.stringify({ type:'comment', id: obj.id, comment }), sock);
               store.saveRoom(room.name, room);
             }
             break;
@@ -333,6 +370,7 @@ function handleData(sock, buf, room){
                         : (obj.id != null ? [obj.id] : null);
               if(!ids || ids.length === 0) break;
               const set = new Set(ids);
+              for(const id of ids) room.lockedElements.delete(id);   // 删除同时解除元素锁定
               const before = room.strokes.length;
               const arr = room.strokes.filter(el => !(el && set.has(el.id)));
               if(arr.length === before) break;                 // 无命中任何 id 则忽略
@@ -450,6 +488,14 @@ function handleData(sock, buf, room){
           case 'set_name':
             sock.name = String(obj.name || '').slice(0, 24) || sock.name;
             presence(room); break;
+          case 'set_bg':
+            if(room.owner && sock._cid !== room.owner){ sendFrame(sock, JSON.stringify({ type:'error', code:'not_owner', msg:'只有房主能设置背景' })); break; }
+            const raw = obj.color;
+            let color = null;
+            if(raw){ const s = String(raw).trim(); if(/^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.test(s)) color = s.toLowerCase(); else { sendFrame(sock, JSON.stringify({ type:'error', code:'bad_color', msg:'背景色需为 #rgb 或 #rrggbb' })); break; } }
+            room.bg = color;
+            broadcast(room, JSON.stringify({ type:'bg', color, by: room.owner }));   // 广播给所有人(含房主)以服务端为准
+            break;
           case 'chat':
             if(typeof obj.text !== 'string') break;
             const chat = { type:'chat', id: sock._cid || '?', name: sock.name || '匿名', text: obj.text.slice(0, 500), t: Date.now() };
@@ -475,6 +521,22 @@ function handleData(sock, buf, room){
               sendFrame(sock, JSON.stringify({ type:'error', code:'not_owner', msg:'只有房主能解锁房间' }));
             }
             break;
+          case 'lock_element':
+            if(sock._cid !== room.owner){ sendFrame(sock, JSON.stringify({ type:'error', code:'not_owner', msg:'只有房主能锁定元素' })); break; }
+            { const lids = (Array.isArray(obj.ids) && obj.ids.length) ? obj.ids : (obj.id != null ? [obj.id] : null);
+              if(!lids){ sendFrame(sock, JSON.stringify({ type:'error', code:'bad_id', msg:'缺少元素 id' })); break; }
+              for(const id of lids) room.lockedElements.add(id);
+              broadcast(room, JSON.stringify({ type:'lock_element', ids: lids, locked:true, by: room.owner }));
+              store.saveRoom(room.name, room); }
+            break;
+          case 'unlock_element':
+            if(sock._cid !== room.owner){ sendFrame(sock, JSON.stringify({ type:'error', code:'not_owner', msg:'只有房主能解锁元素' })); break; }
+            { const lids = (Array.isArray(obj.ids) && obj.ids.length) ? obj.ids : (obj.id != null ? [obj.id] : null);
+              if(!lids){ sendFrame(sock, JSON.stringify({ type:'error', code:'bad_id', msg:'缺少元素 id' })); break; }
+              for(const id of lids) room.lockedElements.delete(id);
+              broadcast(room, JSON.stringify({ type:'lock_element', ids: lids, locked:false, by: room.owner }));
+              store.saveRoom(room.name, room); }
+            break;
           case 'transfer':
             if(sock._cid !== room.owner){
               sendFrame(sock, JSON.stringify({ type:'error', code:'not_owner', msg:'只有房主能转让房主' }));
@@ -492,6 +554,28 @@ function handleData(sock, buf, room){
             }
             room.owner = obj.toId;
             broadcast(room, JSON.stringify({ type:'owner', owner: room.owner, locked: !!room.locked }));
+            break;
+          case 'kick':    // 房主踢人：关闭目标连接并广播通知（被踢者不回显）
+            if(sock._cid !== room.owner){
+              sendFrame(sock, JSON.stringify({ type:'error', code:'not_owner', msg:'只有房主能踢人' }));
+              break;
+            }
+            if(typeof obj.toId !== 'string' || obj.toId.length === 0){
+              sendFrame(sock, JSON.stringify({ type:'error', code:'bad_to', msg:'kick 需要有效的 toId' }));
+              break;
+            }
+            if(obj.toId === room.owner){
+              sendFrame(sock, JSON.stringify({ type:'error', code:'kick_self', msg:'不能踢出房主本人' }));
+              break;
+            }
+            let target = null;
+            for(const c of room.clients){ if(c._cid === obj.toId){ target = c; break; } }
+            if(!target){
+              sendFrame(sock, JSON.stringify({ type:'error', code:'no_such_user', msg:'目标用户不在房间内' }));
+              break;
+            }
+            broadcast(room, JSON.stringify({ type:'kicked', id: obj.toId, by: room.owner }), target);
+            target.destroy();   // 关闭被踢者连接（触发 onLeave，更新 presence/房间列表）
             break;
         }
       }catch(e){ /* ignore */ }
@@ -540,6 +624,7 @@ const server = net.createServer(sock=>{
       buffer = buffer.slice(idx + 4);
       sendFrame(sock, JSON.stringify({ type:'welcome', id: sock._cid, color: sock.color, room: roomName }));
       sendFrame(sock, JSON.stringify({ type:'snapshot', strokes: room.strokes, chats: room.chats, room: roomName }));
+      if(room.bg) sendFrame(sock, JSON.stringify({ type:'bg', color: room.bg, by: room.owner }));  // 迟到者也能拿到当前背景
       presence(room);
       broadcastRoomList();
       if(buffer.length) buffer = handleData(sock, buffer, room);
