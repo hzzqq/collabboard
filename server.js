@@ -140,7 +140,7 @@ function handleData(sock, buf, room){
         try{
           let obj = JSON.parse(msg);
           // 房间锁定时，非房主的编辑类操作被拒绝（仅回错误给发起者，不广播、不入栈）
-          const EDIT_OPS = new Set(['stroke','text','image','move','replace','clear','undo','redo','duplicate','rotate','delete']);
+          const EDIT_OPS = new Set(['stroke','text','image','move','replace','clear','undo','redo','duplicate','rotate','delete','pin']);
           if(EDIT_OPS.has(obj.type) && room.locked && sock._cid !== room.owner){
             sendFrame(sock, JSON.stringify({ type:'error', code:'locked', msg:'房间已锁定，仅房主可编辑' }));
             obj = { type:'__noop__' };
@@ -156,6 +156,24 @@ function handleData(sock, buf, room){
           case 'text':
             if(typeof obj.text !== 'string') break;
             {
+              // 编辑已有文字：若提供了已存在的 text 元素 id，则原地更新其字段（保留 id/author）
+              const existing = (obj.id != null) ? room.strokes.find(el => el && el.id === obj.id) : null;
+              if(existing && existing.type === 'text'){
+                const idx = room.strokes.indexOf(existing);
+                const updated = Object.assign({}, existing, {
+                  text: obj.text.slice(0, 200),
+                  x: obj.x !== undefined ? (+obj.x || 0) : existing.x,
+                  y: obj.y !== undefined ? (+obj.y || 0) : existing.y,
+                  width: obj.width !== undefined ? (+obj.width || 16) : existing.width
+                });
+                if(typeof obj.color === 'string') updated.color = obj.color;
+                const newArr = room.strokes.slice();
+                newArr[idx] = updated;
+                hist.commitStrokes(room, newArr);   // 旧状态进撤销栈，room.strokes 变 newArr（沿用 ci79 修复后的正确顺序）
+                broadcast(room, JSON.stringify({ type:'replace', strokes: room.strokes }), sock);
+                store.saveRoom(room.name, room);
+                break;
+              }
               const t = { type:'text', id: obj.id != null ? obj.id : (sock._cid + ':' + (++strokeSeq)),
                 x: +obj.x||0, y: +obj.y||0,
                 text: obj.text.slice(0, 200), color: typeof obj.color==='string'?obj.color:'#ffffff',
@@ -175,6 +193,18 @@ function handleData(sock, buf, room){
                 author: sock._cid, authorColor: sock.color };
               hist.commitStrokes(room, room.strokes.concat(img));
               broadcast(room, JSON.stringify(img), sock);
+              store.saveRoom(room.name, room);
+            }
+            break;
+          case 'pin':
+            if(obj.x == null || obj.y == null) break;
+            {
+              const pin = { type:'pin', id: obj.id != null ? obj.id : (sock._cid + ':' + (++strokeSeq)),
+                x: +obj.x||0, y: +obj.y||0,
+                label: typeof obj.label === 'string' ? obj.label.slice(0,30) : '',
+                author: sock._cid, authorColor: sock.color };
+              hist.commitStrokes(room, room.strokes.concat(pin));
+              broadcast(room, JSON.stringify(pin), sock);
               store.saveRoom(room.name, room);
             }
             break;

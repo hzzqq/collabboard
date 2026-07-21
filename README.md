@@ -27,6 +27,9 @@
 - **克隆选中元素（duplicate）**：服务端深拷贝选中 strokes、分配新 id、偏移（+20,+20）、进撤销栈、广播 `replace`、落盘；客户端一键克隆。
 - **旋转选中元素（rotate）**：服务端 `rotateElement` 绕组质心按 90° 整数倍旋转（矢量转点、文字 / 图片转锚点 + 累计 `rot`），进撤销栈、广播、落盘；客户端左右 90° 按钮 + 旋转渲染。
 - **选择性删除（delete）**：服务端按 `ids` 从房间移除选中元素、进撤销栈、广播 `replace`、落盘（沿用正确撤销提交顺序）；客户端删除按钮 + 删除后清理选中集。
+- **编辑已有文字（text-edit）**：服务端 `text` 消息携带已存在文字元素 id 时原地更新字段（保留 id/author）、进撤销栈、广播 `replace`、落盘；客户端非绘制工具下双击文字弹出编辑。
+- **网格对齐（grid）**：`grid.js` 纯函数 `snapPoint`/`gridLines`，绘制（笔/擦/线框/文字）吸附到网格，开启时画布叠加淡网格线，网格尺寸可调（10/20/40/50）。
+- **标记点 pin**：服务端 `pin` 消息（接收 x/y/label，分配 id、权威署名 author/authorColor，进撤销栈、广播、落盘），并纳入 EDIT_OPS 锁保护（锁定房间时非房主被拒）；客户端新增 📍 标记工具（点击落点）、彩色圆点 + 白边渲染。
 
 ## 🧱 技术栈
 
@@ -44,11 +47,11 @@ node server.js
 
 ## 🧪 测试
 
-十八套端到端测试（手写 WS / HTTP 客户端，测试独立端口避免与本机其他服务争用 8080）：
+二十一 套端到端测试（手写 WS / HTTP 客户端，测试独立端口避免与本机其他服务争用 8080）：
 
 ```bash
 npm test
-# 十八套端到端测试（手写 WS / HTTP 客户端），共 154/154 通过：
+# 二十一 套端到端测试（手写 WS / HTTP 客户端），共 181/181 通过：
 # _store_test      (6/6)   房间磁盘持久化
 # _wb_text_test    (5/5)   文字工具 + 图形填充
 # _move_test       (6/6)   元素拖拽移动（稳定 id / 广播 / 快照平移）
@@ -67,6 +70,9 @@ npm test
 # _duplicate_test  (12/12) 克隆选中元素（深拷贝 / 新 id / 偏移 / 撤销 / 广播）
 # _rotate_test     (15/15) 旋转选中元素（90° 整数倍 / 质心 / 撤销 / 渲染）
 # _delete_test     (11/11) 选择性删除（ids 过滤 / 撤销两次还原）
+# _text_edit_test  (6/6)   编辑已有文字（按 id 原地更新 / 撤销还原）
+# _grid_test       (11/11) 网格对齐（snapPoint/gridLines / 绘制吸附）
+# _pin_test        (10/10) 标记点 pin（广播 / 落盘 / 锁定后非房主被拒）
 ```
 
 ## 🏗 架构
@@ -77,7 +83,7 @@ server.js
  ├─ WS 握手 (Sec-WebSocket-Accept) + 帧解析/组装
  ├─ httpServe() —— 非 WS 的 GET 走 HTTP 管理 API
  ├─ rooms Map —— 房间隔离 + presence + 50 条历史
- ├─ handleData() —— stroke/cursor/text/typing/chat/set_name/replace/move/zorder/duplicate/rotate/delete/lock(unlock) 分发（编辑类 OP 受 lock 守卫）
+ ├─ handleData() —— stroke/cursor/text/typing/chat/set_name/replace/move/zorder/duplicate/rotate/delete/pin/lock(unlock) 分发（编辑类 OP 受 lock 守卫）
  └─ 心跳 ping/pong + 死连接回收
 store.js —— 房间数据 getRoom/落盘 (rooms/*.json)
 index.html —— Canvas 绘图 + 多人光标 + 聊天 + 撤销重做 + 导出

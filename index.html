@@ -79,6 +79,7 @@
       <button data-tool="eraser">橡皮</button>
       <button data-tool="select">选择/移动</button>
       <button data-tool="marquee">▢ 框选</button>
+      <button data-tool="pin">📍 标记</button>
       <button id="imgBtn">🖼 插入图片</button>
       <button id="clear">清屏</button>
       <button id="selAll">☑ 全选</button>
@@ -117,6 +118,20 @@
       <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
         <input type="checkbox" id="fill" /> 填充形状（矩形/椭圆）
       </label>
+    </div>
+    <div class="row">
+      <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+        <input type="checkbox" id="snap" /> 对齐网格（绘制吸附到网格）
+      </label>
+    </div>
+    <div class="row">
+      <label>网格尺寸 <span class="val" id="gsVal">20</span></label>
+      <select id="gridSize">
+        <option value="10">10</option>
+        <option value="20" selected>20</option>
+        <option value="40">40</option>
+        <option value="50">50</option>
+      </select>
     </div>
     <div class="row tools">
       <button id="undo">↶ 撤销</button>
@@ -168,6 +183,7 @@
   </div>
 </div>
 <script src="svg.js"></script>
+<script src="grid.js"></script>
 <script>
 const cv = document.getElementById('cv');
 const ctx = cv.getContext('2d');
@@ -206,6 +222,15 @@ function snapshot(){ history = history.slice(0, hptr+1); history.push(clone(stro
 function drawStroke(s){
   ctx.save();
   ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  if(s.type === 'pin'){
+    // 标记：彩色圆点 + 白边 + 中心小白点，便于协作时指向画布某处
+    ctx.translate(s.x*dpr, s.y*dpr);
+    ctx.beginPath(); ctx.arc(0, 0, 9*dpr, 0, Math.PI*2);
+    ctx.fillStyle = s.authorColor || '#7ee787'; ctx.fill();
+    ctx.lineWidth = 2*dpr; ctx.strokeStyle = '#0c0f14'; ctx.stroke();
+    ctx.beginPath(); ctx.arc(0, 0, 3*dpr, 0, Math.PI*2); ctx.fillStyle = '#ffffff'; ctx.fill();
+    ctx.restore(); return;
+  }
   if(s.type === 'image'){
     const key = s.id || s.src;
     let im = imgCache.get(key);
@@ -252,6 +277,12 @@ function drawStroke(s){
 }
 function redraw(){
   ctx.clearRect(0,0,cv.width,cv.height);
+  if(snOn && typeof gridLines === 'function'){
+    const W = cv.width / dpr, H = cv.height / dpr;
+    ctx.save(); ctx.strokeStyle = 'rgba(255,255,255,0.08)'; ctx.lineWidth = 1;
+    for(const L of gridLines(W, H, gridSize)){ ctx.beginPath(); ctx.moveTo(L[0]*dpr, L[1]*dpr); ctx.lineTo(L[2]*dpr, L[3]*dpr); ctx.stroke(); }
+    ctx.restore();
+  }
   for(const s of strokes) drawStroke(s);
   for(const s of strokes) if(selectedIds.has(s.id)){ const b = bboxOf(s); if(b) drawSelBox(b); }
   if(marquee) drawMarquee(marquee);
@@ -335,11 +366,18 @@ function selectAll(){ selectedIds = new Set(strokes.filter(s=>s&&s.id!=null).map
 function clearSelect(){ selectedIds = new Set(); redraw(); }
 
 // ---------- 指针交互 ----------
-let drawing = false, current = null, tool = 'pen', color = '#f78c6c', width = 4, fill = false;
+let drawing = false, current = null, tool = 'pen', color = '#f78c6c', width = 4, fill = false, snOn = false, gridSize = 20;
 let dragging = false, dragEl = null, startX = 0, startY = 0, lastX = 0, lastY = 0;
 function pos(e){ const r = cv.getBoundingClientRect(); return { x:e.clientX-r.left, y:e.clientY-r.top, p:(typeof e.pressure==='number' ? e.pressure : 0.5) }; }
+// 网格吸附：开启时把指针坐标吸附到 gridSize 整数倍；返回 {x,y,p} 与原结构兼容
+function snapP(p){ return (typeof snapPoint === 'function' && snOn) ? (()=>{ const q = snapPoint(p.x, p.y, gridSize); return { x:q[0], y:q[1], p:p.p }; })() : p; }
 cv.addEventListener('pointerdown', e=>{
   const p = pos(e);
+  if(tool === 'pin'){
+    const pin = { type:'pin', id: myId + ':' + (++localSeq), x: p.x, y: p.y, label: '', author: myId, authorColor: myColor };
+    strokes.push(pin); snapshot(); send({ type:'pin', pin });
+    return;
+  }
   if(tool === 'marquee'){
     marquee = { x0:p.x, y0:p.y, x1:p.x, y1:p.y }; marqueeing = true; cv.setPointerCapture(e.pointerId); return;
   }
@@ -353,7 +391,7 @@ cv.addEventListener('pointerdown', e=>{
     redraw(); return;
   }
   drawing = true; cv.setPointerCapture(e.pointerId);
-  current = { tool, color, width, erase: tool==='eraser', fill, points:[p] };
+  current = { tool, color, width, erase: tool==='eraser', fill, points:[snapP(p)] };
   if(tool==='line'||tool==='rect'||tool==='ellipse') current.points.push(p);
 });
 cv.addEventListener('pointermove', e=>{
@@ -374,7 +412,7 @@ cv.addEventListener('pointermove', e=>{
     lastX = p.x; lastY = p.y; redraw(); return;
   }
   if(!drawing) return;
-  const p2 = pos(e);
+  const p2 = snapP(pos(e));
   if(tool==='pen'||tool==='eraser') current.points.push(p2);
   else current.points[1] = p2;
   redraw();
@@ -407,7 +445,8 @@ cv.addEventListener('pointerup', ()=>{
       current.text = t.trim();
       current.id = myId + ':' + (++localSeq);
       strokes.push(current); snapshot();
-      send({ type:'text', text: current.text, id: current.id, x: current.points[0].x, y: current.points[0].y, color, width });
+      const tp = snapP(current.points[0]);
+      send({ type:'text', text: current.text, id: current.id, x: tp.x, y: tp.y, color, width });
     }
     current = null; redraw(); return;
   }
@@ -421,6 +460,19 @@ cv.addEventListener('pointerup', ()=>{
   current = null; redraw();
 });
 
+// 双击编辑已有文字（非绘制工具下）：找到命中的文字元素，原地改字（按 id 发给服务端）
+cv.addEventListener('dblclick', e=>{
+  if(tool==='pen'||tool==='eraser'||tool==='line'||tool==='rect'||tool==='ellipse') return;
+  const p = pos(e);
+  const hit = hitTest(p.x, p.y);
+  if(hit && hit.type==='text'){
+    const nv = (typeof prompt==='function') ? prompt('编辑文字：', hit.text || '') : null;
+    if(nv!=null && nv.trim()){
+      send({ type:'text', id: hit.id, text: nv.trim(), x: hit.x, y: hit.y, color: hit.color, width: hit.width });
+    }
+  }
+});
+
 // ---------- 控件 ----------
 document.querySelectorAll('[data-tool]').forEach(b=>{
   b.onclick = ()=>{
@@ -432,6 +484,8 @@ document.querySelectorAll('[data-tool]').forEach(b=>{
 $('color').oninput = e=> color = e.target.value;
 $('width').oninput = e=>{ width=+e.target.value; $('wVal').textContent=width; };
 $('fill').onchange = e=> fill = e.target.checked;
+$('snap').onchange = e=>{ snOn = e.target.checked; redraw(); };
+$('gridSize').oninput = e=>{ gridSize = +e.target.value; $('gsVal').textContent = gridSize; if(snOn) redraw(); };
 $('clear').onclick = ()=>{ strokes=[]; current=null; history=[[]]; hptr=0; redraw(); send({type:'clear'}); };
 $('selAll').onclick = selectAll;
 $('selNone').onclick = clearSelect;
@@ -597,6 +651,8 @@ function connect(){
       case 'text':
         strokes.push(m); history = history.slice(0,hptr+1); history.push(clone(strokes)); hptr++; redraw(); break;
       case 'image':
+        strokes.push(m); history = history.slice(0,hptr+1); history.push(clone(strokes)); hptr++; redraw(); break;
+      case 'pin':
         strokes.push(m); history = history.slice(0,hptr+1); history.push(clone(strokes)); hptr++; redraw(); break;
       case 'move':
         if(Array.isArray(m.ids)){
