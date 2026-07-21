@@ -73,7 +73,8 @@ function rotateElement(el, deg, cx, cy){
 }
 function presence(room){
   const names = [...room.clients].map(c => c.name || ('用户' + (c._cid || '?')));
-  broadcast(room, JSON.stringify({ type:'presence', count: room.clients.size, names }));
+  const ids = [...room.clients].map(c => c._cid);
+  broadcast(room, JSON.stringify({ type:'presence', count: room.clients.size, names, ids }));
 }
 // 全局房间列表负载：所有房间名 + 笔画数 + 在线人数（供大厅展示活跃房间）
 function roomListPayload(){
@@ -140,7 +141,7 @@ function handleData(sock, buf, room){
         try{
           let obj = JSON.parse(msg);
           // 房间锁定时，非房主的编辑类操作被拒绝（仅回错误给发起者，不广播、不入栈）
-          const EDIT_OPS = new Set(['stroke','text','image','move','replace','clear','undo','redo','duplicate','rotate','delete','pin']);
+          const EDIT_OPS = new Set(['stroke','text','image','move','replace','clear','undo','redo','duplicate','rotate','delete','pin','group','ungroup','align']);
           if(EDIT_OPS.has(obj.type) && room.locked && sock._cid !== room.owner){
             sendFrame(sock, JSON.stringify({ type:'error', code:'locked', msg:'房间已锁定，仅房主可编辑' }));
             obj = { type:'__noop__' };
@@ -340,7 +341,101 @@ function handleData(sock, buf, room){
               store.saveRoom(room.name, room);
             }
             break;
+          case 'group':
+            {
+              const ids = Array.isArray(obj.ids) ? obj.ids : null;
+              const gid = obj.group;
+              if(!ids || ids.length === 0 || typeof gid !== 'string' || !gid) break;
+              const set = new Set(ids);
+              let changed = 0;
+              const arr = room.strokes.map(el => {
+                if(el && set.has(el.id) && !el.group){ const c = JSON.parse(JSON.stringify(el)); c.group = gid; changed++; return c; }
+                return el;
+              });
+              if(changed === 0) break;
+              hist.commitStrokes(room, arr);
+              broadcast(room, JSON.stringify({ type:'replace', strokes: room.strokes }), sock);
+              store.saveRoom(room.name, room);
+            }
+            break;
+          case 'ungroup':
+            {
+              const ids = Array.isArray(obj.ids) ? obj.ids : null;
+              if(!ids || ids.length === 0) break;
+              const set = new Set(ids);
+              let changed = 0;
+              const arr = room.strokes.map(el => {
+                if(el && set.has(el.id) && el.group){ const c = JSON.parse(JSON.stringify(el)); delete c.group; changed++; return c; }
+                return el;
+              });
+              if(changed === 0) break;
+              hist.commitStrokes(room, arr);
+              broadcast(room, JSON.stringify({ type:'replace', strokes: room.strokes }), sock);
+              store.saveRoom(room.name, room);
+            }
+            break;
+          case 'align':
+            {
+              const ids = Array.isArray(obj.ids) ? obj.ids : null;
+              const how = obj.how;
+              const HORIZ = new Set(['left','center','right']), VERT = new Set(['top','middle','bottom']);
+              if(!ids || ids.length === 0 || (!HORIZ.has(how) && !VERT.has(how))) break;
+              const set = new Set(ids);
+              const sel = room.strokes.filter(el => el && set.has(el.id));
+              if(sel.length === 0) break;
+              // 单元素对齐无意义
+              if(sel.length === 1) break;
+              // 元素包围盒
+              const bboxOf = (el) => {
+                if(Array.isArray(el.points) && el.points.length){
+                  let x0=Infinity,y0=Infinity,x1=-Infinity,y1=-Infinity;
+                  for(const p of el.points){ x0=Math.min(x0,p.x||0); y0=Math.min(y0,p.y||0); x1=Math.max(x1,p.x||0); y1=Math.max(y1,p.y||0); }
+                  return { x0, y0, x1, y1 };
+                }
+                const x = el.x||0, y = el.y||0; return { x0:x, y0:y, x1:x, y1:y };
+              };
+              // 选区整体包围盒
+              let sX0=Infinity,sY0=Infinity,sX1=-Infinity,sY1=-Infinity;
+              for(const el of sel){ const b = bboxOf(el); sX0=Math.min(sX0,b.x0); sY0=Math.min(sY0,b.y0); sX1=Math.max(sX1,b.x1); sY1=Math.max(sY1,b.y1); }
+              const sCx = (sX0+sX1)/2, sCy = (sY0+sY1)/2;
+              const translate = (el, dx, dy) => {
+                const c = JSON.parse(JSON.stringify(el));
+                if(Array.isArray(c.points)){ for(const p of c.points){ p.x=(p.x||0)+dx; p.y=(p.y||0)+dy; } }
+                else { c.x=(c.x||0)+dx; c.y=(c.y||0)+dy; }
+                return c;
+              };
+              const arr = room.strokes.map(el => {
+                if(!set.has(el.id)) return el;
+                const b = bboxOf(el);
+                let dx = 0, dy = 0;
+                if(HORIZ.has(how)){
+                  if(how === 'left') dx = sX0 - b.x0;
+                  else if(how === 'right') dx = sX1 - b.x1;
+                  else dx = sCx - (b.x0+b.x1)/2;            // center
+                }
+                if(VERT.has(how)){
+                  if(how === 'top') dy = sY0 - b.y0;
+                  else if(how === 'bottom') dy = sY1 - b.y1;
+                  else dy = sCy - (b.y0+b.y1)/2;            // middle
+                }
+                return translate(el, dx, dy);
+              });
+              hist.commitStrokes(room, arr);
+              broadcast(room, JSON.stringify({ type:'replace', strokes: room.strokes }), sock);
+              store.saveRoom(room.name, room);
+            }
+            break;
           case 'cursor':  broadcast(room, msg, sock); break;       // 不存储，仅转发
+          case 'ping':    // 元素提醒：广播给其他人（带作者名/色），不落库、不受房间锁限制
+            if(typeof obj.id === 'string' && obj.id){
+              broadcast(room, JSON.stringify({ type:'ping', id: obj.id, author: sock._cid, name: sock.name || '匿名', color: sock.color }), sock);
+            }
+            break;
+          case 'select':  // 选区在场：广播当前选择给他人（不落库、不受锁限制），便于看到协作者的选择
+            if(Array.isArray(obj.ids)){
+              broadcast(room, JSON.stringify({ type:'select', ids: obj.ids, author: sock._cid, name: sock.name || '匿名', color: sock.color }), sock);
+            }
+            break;
           case 'laser':   // 临时激光笔：不存储、不入库、不受房间锁限制，仅实时转发给他人
             if(typeof obj.x === 'number' && typeof obj.y === 'number'){
               broadcast(room, JSON.stringify({ type:'laser', x: obj.x, y: obj.y, color: sock.color, author: sock._cid, name: sock.name || '匿名' }), sock);
@@ -379,6 +474,24 @@ function handleData(sock, buf, room){
             } else {
               sendFrame(sock, JSON.stringify({ type:'error', code:'not_owner', msg:'只有房主能解锁房间' }));
             }
+            break;
+          case 'transfer':
+            if(sock._cid !== room.owner){
+              sendFrame(sock, JSON.stringify({ type:'error', code:'not_owner', msg:'只有房主能转让房主' }));
+              break;
+            }
+            if(typeof obj.toId !== 'string' || obj.toId.length === 0){
+              sendFrame(sock, JSON.stringify({ type:'error', code:'bad_to', msg:'transfer 需要有效的 toId' }));
+              break;
+            }
+            let found = false;
+            for(const c of room.clients){ if(c._cid === obj.toId){ found = true; break; } }
+            if(!found){
+              sendFrame(sock, JSON.stringify({ type:'error', code:'no_such_user', msg:'目标用户不在房间内' }));
+              break;
+            }
+            room.owner = obj.toId;
+            broadcast(room, JSON.stringify({ type:'owner', owner: room.owner, locked: !!room.locked }));
             break;
         }
       }catch(e){ /* ignore */ }

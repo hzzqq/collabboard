@@ -87,6 +87,20 @@
       <button id="selAll">☑ 全选</button>
       <button id="selNone">✕ 取消选择</button>
       <button id="dupBtn">⧉ 克隆选中</button>
+      <button id="groupBtn">🔗 编组选中</button>
+      <button id="ungroupBtn">🔓 解组选中</button>
+      <button id="pingBtn">🔔 提醒选中</button>
+    </div>
+    <div class="row">
+      <label>对齐（需先选中≥2个元素）</label>
+      <div style="display:flex; gap:6px; flex-wrap:wrap;">
+        <button id="alignL">⬅ 左</button>
+        <button id="alignC">↔ 中</button>
+        <button id="alignR">➡ 右</button>
+        <button id="alignT">⬆ 顶</button>
+        <button id="alignM">↕ 中</button>
+        <button id="alignB">⬇ 底</button>
+      </div>
     </div>
     <div class="row">
       <label>图层顺序（需先选中元素）</label>
@@ -155,6 +169,9 @@
         <button id="unlockBtn">🔓 解锁</button>
       </div>
       <div style="font-size:11px;color:#6b7888;margin-top:6px;">房主：<span id="ownerName">—</span></div>
+      <div class="tools" style="margin-top:6px;">
+        <button id="transferBtn">🤝 转让房主</button>
+      </div>
     </div>
     <div class="row"><button id="save">保存 PNG</button></div>
 <div class="row"><button id="saveSvg">导出 SVG（矢量）</button></div>
@@ -298,8 +315,29 @@ function redraw(){
   }
   for(const s of strokes) drawStroke(s);
   for(const s of strokes) if(selectedIds.has(s.id)){ const b = bboxOf(s); if(b) drawSelBox(b); }
+  // 协作者的选区：以协作者颜色虚线框显示（在场感知）
+  for(const [, sel] of remoteSelections){
+    for(const id of sel.ids){
+      const s = strokes.find(x => x && x.id === id); if(!s) continue;
+      const b = bboxOf(s); if(b) drawRemoteSel(b, sel.color, sel.name);
+    }
+  }
+  // 元素提醒：被他人 ping 的元素闪烁黄色光晕（随时间淡出）
+  const now = Date.now();
+  for(const [id, exp] of pinged){
+    if(now > exp) continue;
+    const s = strokes.find(x => x && x.id === id); if(!s) continue;
+    const b = bboxOf(s); if(!b) continue;
+    const pad = 10, a = Math.max(0, 1 - (exp - now) / 1300);
+    ctx.save();
+    ctx.strokeStyle = 'rgba(255,214,0,' + (0.95 - 0.55*a) + ')';
+    ctx.lineWidth = 4*dpr; ctx.shadowColor = 'rgba(255,214,0,0.9)'; ctx.shadowBlur = 16*dpr;
+    ctx.strokeRect((b.x-pad)*dpr, (b.y-pad)*dpr, (b.w+2*pad)*dpr, (b.h+2*pad)*dpr);
+    ctx.restore();
+  }
   if(marquee) drawMarquee(marquee);
   if(current) drawStroke(current);
+  broadcastSelect();   // 本地选区变化时广播给协作者（在场感知）
 }
 function drawCursors(){
   octx.clearRect(0,0,ov.width,ov.height);
@@ -378,11 +416,38 @@ function bboxOf(s){
 }
 // ---------- 多选 / 框选 ----------
 let selectedIds = new Set();   // 当前选中的元素 id 集合（群组移动用）
+let remoteSelections = new Map(); // cid -> { ids:[], color, name } 协作者的选区（在场显示）
+const pinged = new Map();     // 元素提醒：id -> 过期时间戳（闪烁高亮）
+let pingTimer = null;
+function schedulePingRedraw(){
+  if(pingTimer) return;
+  pingTimer = setInterval(()=>{
+    const now = Date.now();
+    for(const [id, exp] of pinged){ if(now > exp) pinged.delete(id); }
+    if(pinged.size === 0){ clearInterval(pingTimer); pingTimer = null; }
+    redraw();
+  }, 80);
+}
+function pingSel(){ if(selectedIds.size === 0) return; for(const id of selectedIds) send({ type:'ping', id }); }
 let dragGroup = null;          // 拖动中的群组 id 列表（null 表示单元素 dragEl）
 let marquee = null, marqueeing = false;  // 框选矩形（画布坐标）
 function drawSelBox(b){        // 选中高亮（虚线方框）
   ctx.save(); ctx.strokeStyle = '#7ee787'; ctx.lineWidth = 2*dpr; ctx.setLineDash([6*dpr,4*dpr]);
   ctx.strokeRect(b.x*dpr-3, b.y*dpr-3, b.w*dpr+6, b.h*dpr+6); ctx.restore();
+}
+function drawRemoteSel(b, color, name){  // 协作者选区的彩色虚线框（带名字标记）
+  ctx.save(); ctx.strokeStyle = color || '#58a6ff'; ctx.lineWidth = 2*dpr; ctx.setLineDash([3*dpr,3*dpr]);
+  ctx.strokeRect(b.x*dpr-5, b.y*dpr-5, b.w*dpr+10, b.h*dpr+10);
+  if(name){ ctx.fillStyle = color || '#58a6ff'; ctx.font = (11*dpr)+'px sans-serif'; ctx.fillText(name, b.x*dpr-5, b.y*dpr-8*dpr); }
+  ctx.restore();
+}
+// 选区在场：本地选择变化时广播给他人（仅在签名变化时发送，避免重绘刷屏）
+let lastSelSig = '';
+function broadcastSelect(){
+  const sig = [...selectedIds].sort().join(',');
+  if(sig === lastSelSig) return;
+  lastSelSig = sig;
+  send({ type:'select', ids: [...selectedIds] });
 }
 function drawMarquee(m){       // 正在框选的半透明矩形
   const x=Math.min(m.x0,m.x1), y=Math.min(m.y0,m.y1), w=Math.abs(m.x1-m.x0), h=Math.abs(m.y1-m.y0);
@@ -411,10 +476,13 @@ cv.addEventListener('pointerdown', e=>{
   if(tool === 'select'){
     const hit = hitTest(p.x, p.y);
     if(hit){
-      if(selectedIds.size > 0 && selectedIds.has(hit.id)) dragGroup = [...selectedIds];   // 拖动整组
-      else { selectedIds = new Set([hit.id]); dragEl = hit; dragGroup = null; }
+      // 命中已编组元素：整组选中；否则仅该元素。Shift 累加选区。
+      const base = hit.group ? strokes.filter(s => s && s.group === hit.group).map(s => s.id) : [hit.id];
+      if(e.shiftKey){ for(const id of base) selectedIds.add(id); }
+      else selectedIds = new Set(base);
+      dragGroup = [...selectedIds]; dragEl = hit;
       dragging = true; startX = lastX = p.x; startY = lastY = p.y; cv.setPointerCapture(e.pointerId);
-    } else { selectedIds = new Set(); dragEl = null; dragGroup = null; }   // 空白点击清空选择
+    } else if(!e.shiftKey){ selectedIds = new Set(); dragEl = null; dragGroup = null; }   // 空白点击清空选择
     redraw(); return;
   }
   drawing = true; cv.setPointerCapture(e.pointerId);
@@ -532,6 +600,18 @@ $('zLower').onclick = ()=> zorder('lower');
 $('zBack').onclick = ()=> zorder('back');
 function duplicateSel(){ if(selectedIds.size === 0) return; send({ type:'duplicate', ids:[...selectedIds] }); }
 $('dupBtn').onclick = duplicateSel;
+function groupSel(){ if(selectedIds.size === 0) return; const gid = myId + ':g' + (++localSeq); send({ type:'group', ids:[...selectedIds], group: gid }); for(const s of strokes){ if(s && selectedIds.has(s.id)) s.group = gid; } redraw(); }
+$('groupBtn').onclick = groupSel;
+function ungroupSel(){ if(selectedIds.size === 0) return; send({ type:'ungroup', ids:[...selectedIds] }); for(const s of strokes){ if(s && selectedIds.has(s.id)) delete s.group; } redraw(); }
+$('ungroupBtn').onclick = ungroupSel;
+$('pingBtn').onclick = pingSel;
+function alignSel(how){ if(selectedIds.size < 2) return; send({ type:'align', ids:[...selectedIds], how }); }
+$('alignL').onclick = ()=> alignSel('left');
+$('alignC').onclick = ()=> alignSel('center');
+$('alignR').onclick = ()=> alignSel('right');
+$('alignT').onclick = ()=> alignSel('top');
+$('alignM').onclick = ()=> alignSel('middle');
+$('alignB').onclick = ()=> alignSel('bottom');
 function rotateSel(deg){ if(selectedIds.size === 0) return; send({ type:'rotate', ids:[...selectedIds], deg }); }
 $('rotL').onclick = ()=> rotateSel(-90);
 $('rotR').onclick = ()=> rotateSel(90);
@@ -721,6 +801,16 @@ function connect(){
       case 'laser_end':
         if(m.author !== myId){ remoteLasers.delete(m.author); drawCursors(); }
         break;
+      case 'ping':   // 他人提醒某元素：闪烁高亮
+        if(m.id != null){ pinged.set(m.id, Date.now() + 1300); schedulePingRedraw(); }
+        break;
+      case 'select':  // 协作者的选区在场显示
+        if(m.author !== myId){
+          if(Array.isArray(m.ids) && m.ids.length) remoteSelections.set(m.author, { ids: m.ids, color: m.color, name: m.name || '协作者' });
+          else remoteSelections.delete(m.author);
+          redraw();
+        }
+        break;
       case 'chat':
         if(m.name !== myName) addChat(m.text, m.name); break;
       case 'typing':
@@ -729,6 +819,7 @@ function connect(){
       case 'presence':
         $('online').textContent = m.count;
         if(Array.isArray(m.names)) renderRoster(m.names);
+        if(Array.isArray(m.ids)) for(const cid of [...remoteSelections.keys()]) if(!m.ids.includes(cid)) remoteSelections.delete(cid);  // 清理已离开者的选区
         break;
       case 'room_list':
         renderRoomList(m.rooms || []);
@@ -754,9 +845,16 @@ function updateLockUI(){
   $('unlockBtn').disabled = !me || !roomLocked;
   $('lockBtn').style.opacity = (!me || roomLocked) ? .45 : 1;
   $('unlockBtn').style.opacity = (!me || !roomLocked) ? .45 : 1;
+  $('transferBtn').disabled = !me;
+  $('transferBtn').style.opacity = !me ? .45 : 1;
 }
 $('lockBtn').onclick = ()=> send({ type:'lock' });
 $('unlockBtn').onclick = ()=> send({ type:'unlock' });
+$('transferBtn').onclick = ()=>{
+  if(roomOwner !== myId){ addChat('⚠ 只有房主可以转让', '', true); return; }
+  const toId = (typeof prompt === 'function') ? prompt('输入要转让房主的用户 ID：') : null;
+  if(toId && toId.trim()) send({ type:'transfer', toId: toId.trim() });
+};
 connect();
 resize();
 </script>
