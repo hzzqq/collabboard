@@ -24,6 +24,9 @@
 - **HTTP 管理 API**：`GET /api/health`、`/api/rooms`、`/api/room?name=`（非 WebSocket 的 GET 请求走 HTTP 路由）。
 - **磁盘持久化**：抽 `store.js`，房间数据落盘 `rooms/`，重启不丢。
 - **导出白板 JSON / SVG（矢量）**：页面一键导出当前画布快照（JSON），或导出无损矢量 SVG（`svg.js` 纯函数，含笔画 / 图形 / 文字 / 图片映射）。
+- **克隆选中元素（duplicate）**：服务端深拷贝选中 strokes、分配新 id、偏移（+20,+20）、进撤销栈、广播 `replace`、落盘；客户端一键克隆。
+- **旋转选中元素（rotate）**：服务端 `rotateElement` 绕组质心按 90° 整数倍旋转（矢量转点、文字 / 图片转锚点 + 累计 `rot`），进撤销栈、广播、落盘；客户端左右 90° 按钮 + 旋转渲染。
+- **选择性删除（delete）**：服务端按 `ids` 从房间移除选中元素、进撤销栈、广播 `replace`、落盘（沿用正确撤销提交顺序）；客户端删除按钮 + 删除后清理选中集。
 
 ## 🧱 技术栈
 
@@ -41,11 +44,11 @@ node server.js
 
 ## 🧪 测试
 
-十五套端到端测试（手写 WS / HTTP 客户端，测试独立端口避免与本机其他服务争用 8080）：
+十八套端到端测试（手写 WS / HTTP 客户端，测试独立端口避免与本机其他服务争用 8080）：
 
 ```bash
 npm test
-# 十五套端到端测试（手写 WS / HTTP 客户端），共 116/116 通过：
+# 十八套端到端测试（手写 WS / HTTP 客户端），共 154/154 通过：
 # _store_test      (6/6)   房间磁盘持久化
 # _wb_text_test    (5/5)   文字工具 + 图形填充
 # _move_test       (6/6)   元素拖拽移动（稳定 id / 广播 / 快照平移）
@@ -61,6 +64,9 @@ npm test
 # _multimove_test  (6/6)   群组移动（ids 数组 / 兼容单 id）
 # _export_test     (19/19) 导出 SVG 矢量（笔画/图形/文字/图片映射 + XML 转义）
 # _zorder_test     (9/9)   图层顺序（置顶/置底/上移/下移 / 群组保持相对序）
+# _duplicate_test  (12/12) 克隆选中元素（深拷贝 / 新 id / 偏移 / 撤销 / 广播）
+# _rotate_test     (15/15) 旋转选中元素（90° 整数倍 / 质心 / 撤销 / 渲染）
+# _delete_test     (11/11) 选择性删除（ids 过滤 / 撤销两次还原）
 ```
 
 ## 🏗 架构
@@ -71,7 +77,7 @@ server.js
  ├─ WS 握手 (Sec-WebSocket-Accept) + 帧解析/组装
  ├─ httpServe() —— 非 WS 的 GET 走 HTTP 管理 API
  ├─ rooms Map —— 房间隔离 + presence + 50 条历史
- ├─ handleData() —— stroke/cursor/text/typing/chat/set_name/replace/move/lock(unlock) 分发（编辑类 OP 受 lock 守卫）
+ ├─ handleData() —— stroke/cursor/text/typing/chat/set_name/replace/move/zorder/duplicate/rotate/delete/lock(unlock) 分发（编辑类 OP 受 lock 守卫）
  └─ 心跳 ping/pong + 死连接回收
 store.js —— 房间数据 getRoom/落盘 (rooms/*.json)
 index.html —— Canvas 绘图 + 多人光标 + 聊天 + 撤销重做 + 导出

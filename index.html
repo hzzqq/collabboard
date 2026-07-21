@@ -83,6 +83,7 @@
       <button id="clear">清屏</button>
       <button id="selAll">☑ 全选</button>
       <button id="selNone">✕ 取消选择</button>
+      <button id="dupBtn">⧉ 克隆选中</button>
     </div>
     <div class="row">
       <label>图层顺序（需先选中元素）</label>
@@ -92,6 +93,16 @@
         <button id="zLower" style="flex:1;">↓ 下移</button>
         <button id="zBack" style="flex:1;">⬇ 置底</button>
       </div>
+    </div>
+    <div class="row">
+      <label>旋转（需先选中元素）</label>
+      <div style="display:flex; gap:6px; flex-wrap:wrap;">
+        <button id="rotL" style="flex:1;">⟲ 左90°</button>
+        <button id="rotR" style="flex:1;">⟳ 右90°</button>
+      </div>
+    </div>
+    <div class="row">
+      <button id="delSelBtn" style="width:100%;">🗑 删除选中元素</button>
     </div>
     <input type="file" id="imgInput" accept="image/*" style="display:none;" />
     <div class="row">
@@ -199,7 +210,12 @@ function drawStroke(s){
     const key = s.id || s.src;
     let im = imgCache.get(key);
     if(!im){ im = new Image(); im.onload = redraw; im.src = s.src; imgCache.set(key, im); }
-    if(im.complete && im.naturalWidth) ctx.drawImage(im, s.x*dpr, s.y*dpr, s.w*dpr, s.h*dpr);
+    if(im.complete && im.naturalWidth){
+      const w = s.w*dpr, h = s.h*dpr, rot = (s.rot||0) * Math.PI/180;
+      ctx.translate(s.x*dpr + w/2, s.y*dpr + h/2);
+      ctx.rotate(rot);
+      ctx.drawImage(im, -w/2, -h/2, w, h);
+    }
     ctx.restore(); return;
   }
   ctx.lineWidth = s.width * dpr;
@@ -207,7 +223,10 @@ function drawStroke(s){
   if(s.type === 'text'){
     ctx.font = (Math.max(10, s.width) * dpr) + 'px ui-monospace, monospace';
     ctx.textBaseline = 'top';
-    ctx.fillText(s.text || '', s.x * dpr, s.y * dpr);
+    const rot = (s.rot||0) * Math.PI/180;
+    ctx.translate(s.x*dpr, s.y*dpr);
+    ctx.rotate(rot);
+    ctx.fillText(s.text || '', 0, 0);
     ctx.restore(); return;
   }
   if(s.erase) ctx.globalCompositeOperation = 'destination-out';
@@ -421,6 +440,13 @@ $('zFront').onclick = ()=> zorder('front');
 $('zRaise').onclick = ()=> zorder('raise');
 $('zLower').onclick = ()=> zorder('lower');
 $('zBack').onclick = ()=> zorder('back');
+function duplicateSel(){ if(selectedIds.size === 0) return; send({ type:'duplicate', ids:[...selectedIds] }); }
+$('dupBtn').onclick = duplicateSel;
+function rotateSel(deg){ if(selectedIds.size === 0) return; send({ type:'rotate', ids:[...selectedIds], deg }); }
+$('rotL').onclick = ()=> rotateSel(-90);
+$('rotR').onclick = ()=> rotateSel(90);
+function deleteSel(){ if(selectedIds.size === 0) return; send({ type:'delete', ids:[...selectedIds] }); }
+$('delSelBtn').onclick = deleteSel;
 $('undo').onclick = undo;
 $('redo').onclick = redo;
 $('join').onclick = ()=>{ manualLeave = true; clearTimeout(reconnectTimer); const v=$('room').value.trim()||'main'; location.search='?room='+encodeURIComponent(v); };
@@ -579,8 +605,12 @@ function connect(){
           const el = strokes.find(s => s && s.id === m.id); if(el) translateLocal(el, m.dx, m.dy);
         }
         redraw(); break;
-      case 'replace':
-        strokes = clone(m.strokes||[]); history=[clone(strokes)]; hptr=0; redraw(); break;
+      case 'replace': {
+        strokes = clone(m.strokes||[]); history=[clone(strokes)]; hptr=0;
+        const live = new Set(strokes.filter(s=>s&&s.id!=null).map(s=>s.id));
+        selectedIds = new Set([...selectedIds].filter(id=> live.has(id)));   // 清理已删除的选中项
+        redraw(); break;
+      }
       case 'clear':
         strokes=[]; history=[[]]; hptr=0; redraw(); break;
       case 'welcome':

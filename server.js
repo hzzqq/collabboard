@@ -53,6 +53,24 @@ function translateElement(el, dx, dy){
   if(el.x != null || el.y != null){ el.x = (el.x||0) + dx; el.y = (el.y||0) + dy; }
   return el;
 }
+// 绕质心 (cx,cy) 将元素旋转 deg 度（仅 90° 整数倍，原地修改并返回）。
+// 矢量：旋转每个点；文字/图片：旋转锚点(x,y)并累计 rot 字段供客户端渲染。
+function rotateElement(el, deg, cx, cy){
+  if(!el || typeof el !== 'object') return el;
+  const rad = (deg % 360) * Math.PI / 180;
+  const cos = Math.round(Math.cos(rad)), sin = Math.round(Math.sin(rad)); // 90°整数倍→整数
+  const rot = (px, py)=>{
+    const x = px - cx, y = py - cy;
+    return [ x*cos - y*sin + cx, x*sin + y*cos + cy ];
+  };
+  if(Array.isArray(el.points)){
+    for(const p of el.points){ const [nx, ny] = rot(p.x||0, p.y||0); p.x = nx; p.y = ny; }
+  } else if(el.x != null || el.y != null){
+    const [nx, ny] = rot(el.x||0, el.y||0); el.x = nx; el.y = ny;
+    el.rot = ((el.rot||0) + deg) % 360;
+  }
+  return el;
+}
 function presence(room){
   const names = [...room.clients].map(c => c.name || ('用户' + (c._cid || '?')));
   broadcast(room, JSON.stringify({ type:'presence', count: room.clients.size, names }));
@@ -122,7 +140,7 @@ function handleData(sock, buf, room){
         try{
           let obj = JSON.parse(msg);
           // 房间锁定时，非房主的编辑类操作被拒绝（仅回错误给发起者，不广播、不入栈）
-          const EDIT_OPS = new Set(['stroke','text','image','move','replace','clear','undo','redo']);
+          const EDIT_OPS = new Set(['stroke','text','image','move','replace','clear','undo','redo','duplicate','rotate','delete']);
           if(EDIT_OPS.has(obj.type) && room.locked && sock._cid !== room.owner){
             sendFrame(sock, JSON.stringify({ type:'error', code:'locked', msg:'房间已锁定，仅房主可编辑' }));
             obj = { type:'__noop__' };
@@ -206,8 +224,7 @@ function handleData(sock, buf, room){
                   }
                 }
               }
-              room.strokes = arr;
-              hist.commitStrokes(room, room.strokes);
+              hist.commitStrokes(room, arr);   // 传新数组，commitStrokes 内部 push 旧 strokes 进撤销栈
               broadcast(room, JSON.stringify({ type:'replace', strokes: room.strokes }));
               store.saveRoom(room.name, room);
             }
@@ -224,6 +241,73 @@ function handleData(sock, buf, room){
             if(hist.redo(room)){
               const rmsg = JSON.stringify({ type:'replace', strokes: room.strokes });
               broadcast(room, rmsg); store.saveRoom(room.name, room);
+            }
+            break;
+          case 'duplicate':
+            {
+              const ids = (obj.ids && Array.isArray(obj.ids)) ? obj.ids
+                        : (obj.id != null ? [obj.id] : null);
+              if(!ids || ids.length === 0) break;
+              const set = new Set(ids);
+              const news = [];
+              for(const el of room.strokes){
+                if(el && set.has(el.id)){
+                  const c = JSON.parse(JSON.stringify(el));   // 深拷贝，断开引用
+                  c.id = sock._cid + ':' + (++strokeSeq);    // 服务端权威新 id
+                  c.author = sock._cid; c.authorColor = sock.color;
+                  if(c.type === 'text'){ c.x = (c.x||0) + 20; c.y = (c.y||0) + 20; }
+                  else if(Array.isArray(c.points)){ for(const p of c.points){ p.x = (p.x||0) + 20; p.y = (p.y||0) + 20; } }
+                  else if(c.x != null || c.y != null){ c.x = (c.x||0) + 20; c.y = (c.y||0) + 20; }
+                  news.push(c);
+                }
+              }
+              if(news.length === 0) break;
+              hist.commitStrokes(room, room.strokes.concat(news));   // 传新数组，旧状态进撤销栈
+              broadcast(room, JSON.stringify({ type:'replace', strokes: room.strokes }), sock);
+              store.saveRoom(room.name, room);
+            }
+            break;
+          case 'rotate':
+            {
+              const ids = (obj.ids && Array.isArray(obj.ids)) ? obj.ids
+                        : (obj.id != null ? [obj.id] : null);
+              let deg = Math.round(+obj.deg || 0);
+              if(!ids || ids.length === 0 || deg === 0) break;
+              if(deg % 90 !== 0) break;                       // 仅支持 90° 整数倍
+              deg = ((deg % 360) + 360) % 360;                // 归一化到 [0,360)
+              const set = new Set(ids);
+              const sel = room.strokes.filter(el => el && set.has(el.id));
+              if(sel.length === 0) break;                    // 没命中任何 id 则忽略
+              // 组质心：所有选中元素锚点（points 平均 / x,y）的均值
+              let sx = 0, sy = 0, cnt = 0;
+              for(const el of sel){
+                if(Array.isArray(el.points)){ for(const p of el.points){ sx += (p.x||0); sy += (p.y||0); cnt++; } }
+                else { sx += (el.x||0); sy += (el.y||0); cnt++; }
+              }
+              const cx = cnt ? sx / cnt : 0, cy = cnt ? sy / cnt : 0;
+              // 深拷贝选中元素后再旋转，避免原地修改污染撤销栈快照（历史需保留旋转前状态）
+              const arr = room.strokes.map(el => {
+                if(!set.has(el.id)) return el;
+                const c = JSON.parse(JSON.stringify(el));
+                return rotateElement(c, deg, cx, cy);
+              });
+              hist.commitStrokes(room, arr);                   // 传新数组，旧状态进撤销栈
+              broadcast(room, JSON.stringify({ type:'replace', strokes: room.strokes }), sock);
+              store.saveRoom(room.name, room);
+            }
+            break;
+          case 'delete':
+            {
+              const ids = (obj.ids && Array.isArray(obj.ids)) ? obj.ids
+                        : (obj.id != null ? [obj.id] : null);
+              if(!ids || ids.length === 0) break;
+              const set = new Set(ids);
+              const before = room.strokes.length;
+              const arr = room.strokes.filter(el => !(el && set.has(el.id)));
+              if(arr.length === before) break;                 // 无命中任何 id 则忽略
+              hist.commitStrokes(room, arr);                   // 传新数组，旧状态进撤销栈
+              broadcast(room, JSON.stringify({ type:'replace', strokes: room.strokes }), sock);
+              store.saveRoom(room.name, room);
             }
             break;
           case 'cursor':  broadcast(room, msg, sock); break;       // 不存储，仅转发
