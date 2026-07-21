@@ -75,11 +75,13 @@
       <button data-tool="line">直线</button>
       <button data-tool="rect">矩形</button>
       <button data-tool="ellipse">椭圆</button>
+      <button data-tool="arrow">↗ 箭头</button>
       <button data-tool="text">文字</button>
       <button data-tool="eraser">橡皮</button>
       <button data-tool="select">选择/移动</button>
       <button data-tool="marquee">▢ 框选</button>
       <button data-tool="pin">📍 标记</button>
+      <button data-tool="laser">🔦 激光笔</button>
       <button id="imgBtn">🖼 插入图片</button>
       <button id="clear">清屏</button>
       <button id="selAll">☑ 全选</button>
@@ -196,6 +198,7 @@ let myId = Math.random().toString(36).slice(2, 8);
 const MY_COLORS = ['#f78c6c','#7ee787','#82aaff','#c792ea','#ffcb6b','#f07178'];
 let myColor = MY_COLORS[Math.floor(Math.random()*MY_COLORS.length)];
 const remoteCursors = new Map();
+const remoteLasers = new Map();   // 临时激光笔：author -> {x,y,color,name,ts}，不持久化
 let myName = '我' + myId.slice(0, 3);
 
 const $ = id => document.getElementById(id);
@@ -272,6 +275,16 @@ function drawStroke(s){
     const rx=Math.abs(p[1].x-p[0].x)/2*dpr, ry=Math.abs(p[1].y-p[0].y)/2*dpr;
     ctx.beginPath(); ctx.ellipse(cx,cy,rx,ry,0,0,Math.PI*2);
     if(s.fill) ctx.fill(); else ctx.stroke();
+  } else if(s.tool === 'arrow'){
+    const x0=p[0].x*dpr, y0=p[0].y*dpr, x1=p[1].x*dpr, y1=p[1].y*dpr;
+    ctx.beginPath(); ctx.moveTo(x0,y0); ctx.lineTo(x1,y1); ctx.stroke();
+    const ang = Math.atan2(y1-y0, x1-x0), hl = 12*dpr;   // 箭头头部（两条斜边）
+    ctx.beginPath();
+    ctx.moveTo(x1, y1);
+    ctx.lineTo(x1 - hl*Math.cos(ang - Math.PI/7), y1 - hl*Math.sin(ang - Math.PI/7));
+    ctx.moveTo(x1, y1);
+    ctx.lineTo(x1 - hl*Math.cos(ang + Math.PI/7), y1 - hl*Math.sin(ang + Math.PI/7));
+    ctx.stroke();
   }
   ctx.restore();
 }
@@ -301,6 +314,20 @@ function drawCursors(){
     octx.closePath(); octx.fill();
     octx.font = (12*dpr)+'px ui-monospace, monospace';
     octx.fillText(id, x+13, y+12);
+    octx.restore();
+  }
+  // 临时激光笔：发光红点 + 光晕
+  for(const [aid, l] of remoteLasers){
+    if(Date.now() - (l.ts||0) > 3000) continue;
+    const x = l.x*dpr, y = l.y*dpr;
+    octx.save();
+    octx.shadowColor = l.color || '#ff3b3b';
+    octx.shadowBlur = 18*dpr;
+    octx.fillStyle = l.color || '#ff3b3b';
+    octx.beginPath(); octx.arc(x, y, 5*dpr, 0, Math.PI*2); octx.fill();
+    octx.shadowBlur = 0;
+    octx.strokeStyle = 'rgba(255,255,255,0.85)'; octx.lineWidth = 1.5*dpr;
+    octx.beginPath(); octx.arc(x, y, 8*dpr, 0, Math.PI*2); octx.stroke();
     octx.restore();
   }
 }
@@ -392,7 +419,7 @@ cv.addEventListener('pointerdown', e=>{
   }
   drawing = true; cv.setPointerCapture(e.pointerId);
   current = { tool, color, width, erase: tool==='eraser', fill, points:[snapP(p)] };
-  if(tool==='line'||tool==='rect'||tool==='ellipse') current.points.push(p);
+  if(tool==='line'||tool==='rect'||tool==='ellipse'||tool==='arrow') current.points.push(p);
 });
 cv.addEventListener('pointermove', e=>{
   // 广播光标
@@ -400,6 +427,14 @@ cv.addEventListener('pointermove', e=>{
     const p = pos(e);
     const now = performance.now();
     if(now - lastCursor > 30){ lastCursor = now; send({ type:'cursor', id:myId, color:myColor, x:p.x, y:p.y }); }
+  }
+  // 激光笔：本地即时显示 + 实时广播给他人（临时，不入库、不受锁限制）
+  if(tool === 'laser'){
+    const p = pos(e);
+    remoteLasers.set(myId, { x:p.x, y:p.y, color:myColor, name:'我', ts:Date.now(), local:true });
+    send({ type:'laser', x:p.x, y:p.y });
+    drawCursors();
+    return;
   }
   // 框选：拖动更新矩形
   if(marqueeing && marquee){ const p = pos(e); marquee.x1 = p.x; marquee.y1 = p.y; redraw(); return; }
@@ -418,6 +453,7 @@ cv.addEventListener('pointermove', e=>{
   redraw();
 });
 cv.addEventListener('pointerup', ()=>{
+  if(tool === 'laser'){ remoteLasers.delete(myId); send({ type:'laser_end' }); drawCursors(); return; }
   if(marqueeing && marquee){
     marqueeing = false;
     const rx=Math.min(marquee.x0,marquee.x1), ry=Math.min(marquee.y0,marquee.y1);
@@ -452,7 +488,7 @@ cv.addEventListener('pointerup', ()=>{
   }
   if(current){
     current.id = myId + ':' + (++localSeq);
-    const isEmpty = current.points.length<2 || (current.points.length===2 && current.tool!=='pen' && current.tool!=='eraser' && current.points[0].x===current.points[1].x && current.points[0].y===current.points[1].y);
+    const isEmpty = current.points.length<2 || (current.points.length===2 && current.tool!=='pen' && current.tool!=='eraser' && current.tool!=='arrow' && current.points[0].x===current.points[1].x && current.points[0].y===current.points[1].y);
     if(!isEmpty){
       strokes.push(current); snapshot(); send({ type:'stroke', stroke:current });
     }
@@ -462,7 +498,7 @@ cv.addEventListener('pointerup', ()=>{
 
 // 双击编辑已有文字（非绘制工具下）：找到命中的文字元素，原地改字（按 id 发给服务端）
 cv.addEventListener('dblclick', e=>{
-  if(tool==='pen'||tool==='eraser'||tool==='line'||tool==='rect'||tool==='ellipse') return;
+  if(tool==='pen'||tool==='eraser'||tool==='line'||tool==='rect'||tool==='ellipse'||tool==='arrow') return;
   const p = pos(e);
   const hit = hitTest(p.x, p.y);
   if(hit && hit.type==='text'){
@@ -678,6 +714,12 @@ function connect(){
         break;
       case 'cursor':
         if(m.id !== myId){ remoteCursors.set(m.id, { x:m.x, y:m.y, color:m.color, ts:Date.now() }); drawCursors(); }
+        break;
+      case 'laser':
+        if(m.author !== myId){ remoteLasers.set(m.author, { x:m.x, y:m.y, color:m.color, name:m.name, ts:Date.now() }); drawCursors(); }
+        break;
+      case 'laser_end':
+        if(m.author !== myId){ remoteLasers.delete(m.author); drawCursors(); }
         break;
       case 'chat':
         if(m.name !== myName) addChat(m.text, m.name); break;

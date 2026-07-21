@@ -341,6 +341,14 @@ function handleData(sock, buf, room){
             }
             break;
           case 'cursor':  broadcast(room, msg, sock); break;       // 不存储，仅转发
+          case 'laser':   // 临时激光笔：不存储、不入库、不受房间锁限制，仅实时转发给他人
+            if(typeof obj.x === 'number' && typeof obj.y === 'number'){
+              broadcast(room, JSON.stringify({ type:'laser', x: obj.x, y: obj.y, color: sock.color, author: sock._cid, name: sock.name || '匿名' }), sock);
+            }
+            break;
+          case 'laser_end':
+            broadcast(room, JSON.stringify({ type:'laser_end', author: sock._cid }), sock);
+            break;
           case 'typing':
             broadcast(room, JSON.stringify({ type:'typing', id: sock._cid, name: sock.name || '匿名', on: obj.on !== false }), sock);
             break;                                      // 不存储，仅转发
