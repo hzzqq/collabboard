@@ -84,6 +84,15 @@
       <button id="selAll">☑ 全选</button>
       <button id="selNone">✕ 取消选择</button>
     </div>
+    <div class="row">
+      <label>图层顺序（需先选中元素）</label>
+      <div style="display:flex; gap:6px; flex-wrap:wrap;">
+        <button id="zFront" style="flex:1;">⬆ 置顶</button>
+        <button id="zRaise" style="flex:1;">↑ 上移</button>
+        <button id="zLower" style="flex:1;">↓ 下移</button>
+        <button id="zBack" style="flex:1;">⬇ 置底</button>
+      </div>
+    </div>
     <input type="file" id="imgInput" accept="image/*" style="display:none;" />
     <div class="row">
       <label>颜色</label>
@@ -407,6 +416,11 @@ $('fill').onchange = e=> fill = e.target.checked;
 $('clear').onclick = ()=>{ strokes=[]; current=null; history=[[]]; hptr=0; redraw(); send({type:'clear'}); };
 $('selAll').onclick = selectAll;
 $('selNone').onclick = clearSelect;
+function zorder(action){ if(selectedIds.size === 0) return; send({ type:'zorder', ids:[...selectedIds], action }); }
+$('zFront').onclick = ()=> zorder('front');
+$('zRaise').onclick = ()=> zorder('raise');
+$('zLower').onclick = ()=> zorder('lower');
+$('zBack').onclick = ()=> zorder('back');
 $('undo').onclick = undo;
 $('redo').onclick = redo;
 $('join').onclick = ()=>{ manualLeave = true; clearTimeout(reconnectTimer); const v=$('room').value.trim()||'main'; location.search='?room='+encodeURIComponent(v); };

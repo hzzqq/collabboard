@@ -179,6 +179,39 @@ function handleData(sock, buf, room){
               store.saveRoom(room.name, room);
             }
             break;
+          case 'zorder':
+            {
+              const ids = (obj.ids && Array.isArray(obj.ids)) ? obj.ids : (obj.id != null ? [obj.id] : null);
+              const action = obj.action;
+              if(!ids || ids.length === 0) break;
+              if(!['front','back','raise','lower'].includes(action)) break;
+              const set = new Set(ids);
+              const sel = room.strokes.filter(el => el && set.has(el.id));
+              if(sel.length === 0) break;                 // 没有命中任何 id 则忽略
+              let arr = room.strokes.slice();
+              if(action === 'front')      arr = arr.filter(el => !(el && set.has(el.id))).concat(sel);          // 置顶（数组末尾 = 最上层）
+              else if(action === 'back')  arr = sel.concat(arr.filter(el => !(el && set.has(el.id))));          // 置底（数组开头 = 最底层）
+              else if(action === 'raise'){
+                for(let i = arr.length - 1; i >= 0; i--){
+                  if(set.has(arr[i].id)){
+                    let j = i + 1; while(j < arr.length && set.has(arr[j].id)) j++;
+                    if(j < arr.length){ const t = arr[i]; arr[i] = arr[j]; arr[j] = t; }
+                  }
+                }
+              } else { // lower
+                for(let i = 0; i < arr.length; i++){
+                  if(set.has(arr[i].id)){
+                    let j = i - 1; while(j >= 0 && set.has(arr[j].id)) j--;
+                    if(j >= 0){ const t = arr[i]; arr[i] = arr[j]; arr[j] = t; }
+                  }
+                }
+              }
+              room.strokes = arr;
+              hist.commitStrokes(room, room.strokes);
+              broadcast(room, JSON.stringify({ type:'replace', strokes: room.strokes }));
+              store.saveRoom(room.name, room);
+            }
+            break;
           case 'replace': hist.commitStrokes(room, obj.strokes || []); broadcast(room, msg, sock); store.saveRoom(room.name, room); break;
           case 'clear':   hist.commitStrokes(room, []); broadcast(room, msg, sock); store.saveRoom(room.name, room); break;
           case 'undo':
