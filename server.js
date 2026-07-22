@@ -3,6 +3,8 @@
 // 不依赖任何 npm 包：自己处理握手、帧解析、掩码、广播。
 const net = require('net');
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 const store = require('./store');
 const hist = require('./history');
 
@@ -20,7 +22,7 @@ const rooms = new Map();
 function getRoom(name){
   let r = rooms.get(name);
   if(!r){
-    r = { clients: new Set(), strokes: [], chats: [], name, owner: null, locked: false, lockedElements: new Set(), bg: null, title: null, _chatSeq: 0 };
+    r = { clients: new Set(), strokes: [], chats: [], name, owner: null, locked: false, lockedElements: new Set(), muted: new Set(), banned: new Set(), bg: null, title: null, _chatSeq: 0, slowMode: 0, _chatAt: {} };
     const saved = store.loadRoom(name);
     if(saved){ r.strokes = saved.strokes; r.chats = saved.chats; if(typeof saved._chatSeq === 'number') r._chatSeq = saved._chatSeq; }
     rooms.set(name, r);
@@ -74,7 +76,8 @@ function rotateElement(el, deg, cx, cy){
 function presence(room){
   const names = [...room.clients].map(c => c.name || ('用户' + (c._cid || '?')));
   const ids = [...room.clients].map(c => c._cid);
-  broadcast(room, JSON.stringify({ type:'presence', count: room.clients.size, names, ids }));
+  const avatars = [...room.clients].map(c => c.avatar || null);
+  broadcast(room, JSON.stringify({ type:'presence', count: room.clients.size, names, ids, avatars }));
 }
 // 全局房间列表负载：所有房间名 + 笔画数 + 在线人数（供大厅展示活跃房间）
 function roomListPayload(){
@@ -495,6 +498,10 @@ function handleData(sock, buf, room){
           case 'set_name':
             sock.name = String(obj.name || '').slice(0, 24) || sock.name;
             presence(room); break;
+          case 'set_avatar':
+            sock.avatar = String(obj.avatar || '').slice(0, 8) || sock.avatar;
+            broadcast(room, JSON.stringify({ type:'avatar', id: sock._cid, avatar: sock.avatar }));  // 广播头像给他人(不落库)
+            break;
           case 'set_bg':
             if(room.owner && sock._cid !== room.owner){ sendFrame(sock, JSON.stringify({ type:'error', code:'not_owner', msg:'只有房主能设置背景' })); break; }
             const raw = obj.color;
@@ -511,8 +518,34 @@ function handleData(sock, buf, room){
             room.title = title;
             broadcast(room, JSON.stringify({ type:'title', title, by: room.owner }));   // 广播给所有人(含房主)
             break;
+          case 'slow_mode': {   // 房主设置慢速模式：聊天最短间隔 seconds(0=关闭)，服务端在 chat 时强制限频
+            if(sock._cid !== room.owner){ sendFrame(sock, JSON.stringify({ type:'error', code:'not_owner', msg:'仅房主可设置慢速模式' })); break; }
+            const s = Math.max(0, Math.min(3600, (obj.seconds|0) || 0));
+            room.slowMode = s; room._chatAt = {};
+            broadcast(room, JSON.stringify({ type:'slow_mode', seconds: s, by: room.owner }));
+            store.saveRoom(room.name, room); break;
+          }
+          case 'whisper': {   // 私聊：仅把消息发给指定 cid 的成员(服务端定向转发，不广播)
+            if(typeof obj.text !== 'string') break;
+            const to = obj.to;
+            if(!to){ sendFrame(sock, JSON.stringify({ type:'error', code:'no_target', msg:'whisper 需要目标 cid' })); break; }
+            let found = null;
+            for(const c of room.clients){ if(c._cid === to){ found = c; break; } }
+            if(!found){ sendFrame(sock, JSON.stringify({ type:'error', code:'no_such_client', msg:'找不到该成员' })); break; }
+            const wmsg = { type:'whisper', from: sock._cid || '?', name: sock.name || '匿名', text: obj.text.slice(0, 500), t: Date.now() };
+            sendFrame(found, JSON.stringify(wmsg));   // 仅发给目标成员
+            break;
+          }
           case 'chat':
             if(typeof obj.text !== 'string') break;
+            if(room.muted.has(sock._cid)){ sendFrame(sock, JSON.stringify({ type:'error', code:'muted', msg:'你已被房主禁言' })); break; }
+            if(room.slowMode > 0){
+              const now = Date.now();
+              const last = room._chatAt[sock._cid] || 0;
+              const gap = room.slowMode * 1000 - (now - last);
+              if(gap > 0){ sendFrame(sock, JSON.stringify({ type:'error', code:'slow_mode', msg:'发言过于频繁，请 ' + Math.ceil(gap/1000) + 's 后再试' })); break; }
+              room._chatAt[sock._cid] = now;
+            }
             const chat = { type:'chat', id: sock._cid || '?', name: sock.name || '匿名', text: obj.text.slice(0, 500), t: Date.now(), mid: ++room._chatSeq };
             room.chats.push(chat);
             if(room.chats.length > 50) room.chats.shift();
@@ -533,7 +566,7 @@ function handleData(sock, buf, room){
               sendFrame(sock, JSON.stringify({ type:'error', code:'no_such_chat', msg:'找不到该聊天消息' }));
             }
             break;
-          case 'request_snapshot': sendFrame(sock, JSON.stringify({ type:'snapshot', strokes: room.strokes })); break;
+          case 'request_snapshot': sendFrame(sock, JSON.stringify({ type:'snapshot', strokes: room.strokes, chats: room.chats })); break;
           case 'room_list': sendFrame(sock, JSON.stringify({ type:'room_list', rooms: roomListPayload() })); break;
           case 'lock':
             if(sock._cid === room.owner){
@@ -621,6 +654,127 @@ function handleData(sock, buf, room){
             broadcast(room, JSON.stringify({ type:'kicked', id: obj.toId, by: room.owner }), target);
             target.destroy();   // 关闭被踢者连接（触发 onLeave，更新 presence/房间列表）
             break;
+          case 'mute':     // 房主禁言：将目标加入 muted 集合，chat 时服务端拦截
+            if(sock._cid !== room.owner){
+              sendFrame(sock, JSON.stringify({ type:'error', code:'not_owner', msg:'只有房主能禁言' }));
+              break;
+            }
+            if(typeof obj.toId !== 'string' || obj.toId.length === 0){
+              sendFrame(sock, JSON.stringify({ type:'error', code:'bad_to', msg:'mute 需要有效的 toId' }));
+              break;
+            }
+            if(obj.toId === room.owner){
+              sendFrame(sock, JSON.stringify({ type:'error', code:'mute_self', msg:'不能禁言房主本人' }));
+              break;
+            }
+            { let mt = null; for(const c of room.clients){ if(c._cid === obj.toId){ mt = c; break; } }
+              if(!mt){ sendFrame(sock, JSON.stringify({ type:'error', code:'no_such_user', msg:'目标用户不在房间内' })); break; }
+              room.muted.add(obj.toId);
+              broadcast(room, JSON.stringify({ type:'muted', id: obj.toId, by: room.owner }));
+              sendFrame(mt, JSON.stringify({ type:'you_muted', by: room.owner }));
+            }
+            break;
+          case 'unmute':   // 房主解禁：从 muted 集合移除目标
+            if(sock._cid !== room.owner){
+              sendFrame(sock, JSON.stringify({ type:'error', code:'not_owner', msg:'只有房主能解禁' }));
+              break;
+            }
+            if(typeof obj.toId !== 'string' || obj.toId.length === 0){
+              sendFrame(sock, JSON.stringify({ type:'error', code:'bad_to', msg:'unmute 需要有效的 toId' }));
+              break;
+            }
+            { let mu = null; for(const c of room.clients){ if(c._cid === obj.toId){ mu = c; break; } }
+              if(!mu){ sendFrame(sock, JSON.stringify({ type:'error', code:'no_such_user', msg:'目标用户不在房间内' })); break; }
+              room.muted.delete(obj.toId);
+              broadcast(room, JSON.stringify({ type:'unmuted', id: obj.toId, by: room.owner }));
+              sendFrame(mu, JSON.stringify({ type:'you_unmuted', by: room.owner }));
+            }
+            break;
+          case 'mute_all':   // 房主全员禁言：将所有非房主成员加入 muted 集合并分别通知
+            if(sock._cid !== room.owner){
+              sendFrame(sock, JSON.stringify({ type:'error', code:'not_owner', msg:'只有房主能全员禁言' }));
+              break;
+            }
+            for(const c of room.clients){
+              if(c._cid === room.owner) continue;
+              room.muted.add(c._cid);
+              sendFrame(c, JSON.stringify({ type:'you_muted', by: room.owner }));
+            }
+            broadcast(room, JSON.stringify({ type:'muted_all', by: room.owner }));
+            break;
+          case 'unmute_all':   // 房主全员解禁：清空 muted 集合并广播
+            if(sock._cid !== room.owner){
+              sendFrame(sock, JSON.stringify({ type:'error', code:'not_owner', msg:'只有房主能全员解禁' }));
+              break;
+            }
+            room.muted.clear();
+            broadcast(room, JSON.stringify({ type:'unmuted_all', by: room.owner }));
+            break;
+          case 'rename':    // 房主重命名房间：内存重键 + 广播 + 尽力重命名持久化文件
+            if(sock._cid !== room.owner){
+              sendFrame(sock, JSON.stringify({ type:'error', code:'not_owner', msg:'只有房主能重命名房间' }));
+              break;
+            }
+            const rawName = (typeof obj.name === 'string') ? obj.name.trim() : '';
+            if(rawName.length === 0 || rawName.length > 40 || /[\/\\]/.test(rawName) || rawName.includes('..')){
+              sendFrame(sock, JSON.stringify({ type:'error', code:'bad_name', msg:'房间名需为 1-40 字符且不含 / \\ ..' }));
+              break;
+            }
+            if(rawName === room.name){ sendFrame(sock, JSON.stringify({ type:'error', code:'same_name', msg:'新名称与当前相同' })); break; }
+            if(rooms.has(rawName)){ sendFrame(sock, JSON.stringify({ type:'error', code:'name_taken', msg:'该房间名已被占用' })); break; }
+            { const oldName = room.name;
+              rooms.delete(oldName);
+              room.name = rawName;
+              rooms.set(rawName, room);
+              for(const c of room.clients){ c.roomName = rawName; }   // 同步各客户端记录的房间名
+              try { const of = store.roomFile(oldName), nf = store.roomFile(rawName); if(fs.existsSync(of)) fs.renameSync(of, nf); } catch(e){ /* 持久化失败不阻断内存重命名 */ }
+              broadcast(room, JSON.stringify({ type:'room_renamed', from: oldName, to: rawName, by: room.owner }));
+              broadcastRoomList();
+            }
+            break;
+          case 'ban':      // 房主封禁：加入 banned 集合，广播通知，断开目标连接（同身份重连将被拒绝）
+            if(sock._cid !== room.owner){
+              sendFrame(sock, JSON.stringify({ type:'error', code:'not_owner', msg:'只有房主能封禁' }));
+              break;
+            }
+            if(typeof obj.toId !== 'string' || obj.toId.length === 0){
+              sendFrame(sock, JSON.stringify({ type:'error', code:'bad_to', msg:'ban 需要有效的 toId' }));
+              break;
+            }
+            if(obj.toId === room.owner){
+              sendFrame(sock, JSON.stringify({ type:'error', code:'ban_self', msg:'不能封禁房主本人' }));
+              break;
+            }
+            { let b = null; for(const c of room.clients){ if(c._cid === obj.toId){ b = c; break; } }
+              if(!b){ sendFrame(sock, JSON.stringify({ type:'error', code:'no_such_user', msg:'目标用户不在房间内' })); break; }
+              room.banned.add(obj.toId);
+              broadcast(room, JSON.stringify({ type:'banned', ids:[...room.banned], by: room.owner }));
+              try { b.destroy(); } catch(e){}
+            }
+            break;
+          case 'clear_room':   // 房主清空房间：清掉所有笔画与聊天记录，并重置撤销栈
+            if(sock._cid !== room.owner){
+              sendFrame(sock, JSON.stringify({ type:'error', code:'not_owner', msg:'只有房主能清空房间' }));
+              break;
+            }
+            room.strokes = [];
+            room.chats = [];
+            room.undoStack = [];
+            room.redoStack = [];
+            broadcast(room, JSON.stringify({ type:'room_cleared', by: room.owner }));
+            store.saveRoom(room.name, room);
+            break;
+          case 'kick_all':   // 房主踢出除自己外的全部成员
+            if(sock._cid !== room.owner){
+              sendFrame(sock, JSON.stringify({ type:'error', code:'not_owner', msg:'只有房主能踢出所有人' }));
+              break;
+            }
+            broadcast(room, JSON.stringify({ type:'kicked_all', by: room.owner }));
+            for(const c of [...room.clients]){
+              if(c._cid === room.owner) continue;
+              try { c.destroy(); } catch(e){}
+            }
+            break;
         }
       }catch(e){ /* ignore */ }
     }
@@ -656,10 +810,12 @@ const server = net.createServer(sock=>{
       );
       handshakeDone = true;
       const room = getRoom(roomName);
-      sock._cid = Math.random().toString(36).slice(2, 8);
+      const _rc = (head.match(/[?&]cid=([a-z0-9]{1,12})/i) || [])[1];
+      sock._cid = _rc || Math.random().toString(36).slice(2, 8);
       sock.name = null;
       sock.color = PALETTE[(connSeq++) % PALETTE.length];
       sock.alive = true;
+      if(room.banned && room.banned.has(sock._cid)){ sendFrame(sock, JSON.stringify({ type:'error', code:'banned', msg:'你已被房主封禁' })); sock.end(); return; }
       room.clients.add(sock);
       if(room.owner == null) room.owner = sock._cid;          // 首个加入者成为房主
       broadcast(room, JSON.stringify({ type:'owner', owner: room.owner, locked: !!room.locked }));
@@ -671,6 +827,7 @@ const server = net.createServer(sock=>{
       if(room.bg) sendFrame(sock, JSON.stringify({ type:'bg', color: room.bg, by: room.owner }));  // 迟到者也能拿到当前背景
       if(room.title) sendFrame(sock, JSON.stringify({ type:'title', title: room.title, by: room.owner }));  // 迟到者也能拿到当前标题
       if(room.lockedElements.size) sendFrame(sock, JSON.stringify({ type:'lock_element', ids: [...room.lockedElements], locked:true, by: room.owner }));  // 迟到者也能拿到已锁定元素集合
+      if(room.muted.size) sendFrame(sock, JSON.stringify({ type:'muted_list', ids: [...room.muted], by: room.owner }));  // 迟到者也能拿到已禁言名单
       presence(room);
       broadcastRoomList();
       if(buffer.length) buffer = handleData(sock, buffer, room);
