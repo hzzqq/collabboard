@@ -22,7 +22,7 @@ const rooms = new Map();
 function getRoom(name){
   let r = rooms.get(name);
   if(!r){
-    r = { clients: new Set(), strokes: [], chats: [], name, owner: null, locked: false, lockedElements: new Set(), muted: new Set(), banned: new Set(), bg: null, title: null, _chatSeq: 0, slowMode: 0, _chatAt: {} };
+    r = { clients: new Set(), strokes: [], chats: [], polls: [], timers: [], name, owner: null, locked: false, lockedElements: new Set(), muted: new Set(), banned: new Set(), bg: null, title: null, _chatSeq: 0, slowMode: 0, _pollSeq: 0, _timerSeq: 0, _chatAt: {} };
     const saved = store.loadRoom(name);
     if(saved){ r.strokes = saved.strokes; r.chats = saved.chats; if(typeof saved._chatSeq === 'number') r._chatSeq = saved._chatSeq; }
     rooms.set(name, r);
@@ -77,7 +77,8 @@ function presence(room){
   const names = [...room.clients].map(c => c.name || ('用户' + (c._cid || '?')));
   const ids = [...room.clients].map(c => c._cid);
   const avatars = [...room.clients].map(c => c.avatar || null);
-  broadcast(room, JSON.stringify({ type:'presence', count: room.clients.size, names, ids, avatars }));
+  const statuses = [...room.clients].map(c => c.status || 'online');
+  broadcast(room, JSON.stringify({ type:'presence', count: room.clients.size, names, ids, avatars, statuses }));
 }
 // 全局房间列表负载：所有房间名 + 笔画数 + 在线人数（供大厅展示活跃房间）
 function roomListPayload(){
@@ -89,6 +90,20 @@ function roomListPayload(){
 function broadcastRoomList(){
   const payload = JSON.stringify({ type: 'room_list', rooms: roomListPayload() });
   for(const room of rooms.values()) broadcast(room, payload);
+}
+// 投票(协作投票/poll)辅助：统计票数与序列化（不让 voters 明细外泄）
+function tallyPoll(poll){
+  const n = poll.options.length;
+  const counts = new Array(n).fill(0);
+  for(const cid in poll.voters){ const i = poll.voters[cid]; if(Number.isInteger(i) && i >= 0 && i < n) counts[i]++; }
+  poll.options.forEach((o, i) => { o.votes = counts[i]; });
+}
+function serializePoll(poll){
+  return { pid: poll.pid, question: poll.question, options: poll.options.map(o => ({ text: o.text, votes: o.votes })),
+           closed: !!poll.closed, author: poll.author, total: Object.keys(poll.voters).length };
+}
+function serializeTimer(t){
+  return { tid: t.tid, label: t.label, total: t.total, remaining: t.remaining, running: !!t.running, author: t.author };
 }
 
 // ---- 极简 HTTP 管理 API（非 WS 的 GET 请求走这里）----
@@ -236,6 +251,28 @@ function handleData(sock, buf, room){
               store.saveRoom(room.name, room);
             }
             break;
+          case 'stamp':   // 图章工具：在画布放置 emoji/短字符装饰（持久化、可撤销、进快照）
+            if(typeof obj.text !== 'string' || !obj.text.trim()) break;
+            {
+              const stamp = { type:'stamp', id: obj.id != null ? obj.id : (sock._cid + ':' + (++strokeSeq)),
+                x: +obj.x||0, y: +obj.y||0,
+                text: obj.text.slice(0, 8).trim(),
+                size: Math.max(8, Math.min(256, +obj.size||48)),
+                color: (typeof obj.color === 'string' && /^#[0-9a-fA-F]{6}$/.test(obj.color)) ? obj.color : '#ffffff',
+                rotation: Math.max(0, Math.min(360, +obj.rotation||0)),
+                author: sock._cid, authorColor: sock.color };
+              hist.commitStrokes(room, room.strokes.concat(stamp));
+              broadcast(room, JSON.stringify(stamp), sock);
+              store.saveRoom(room.name, room);
+            }
+            break;
+          case 'reaction': {   // 画布表情反应：飘出 emoji（瞬时、不进快照、不持久化），与 chat_react 区分
+            const emoji = (typeof obj.emoji === 'string') ? String(obj.emoji).slice(0, 8).trim() : '';
+            if(!emoji) break;
+            const x = +obj.x || 0, y = +obj.y || 0;
+            broadcast(room, JSON.stringify({ type:'reaction', emoji, x, y, by: sock._cid, name: sock.name || '匿名', color: sock.color }));
+            break;
+          }
           case 'comment':
             if(typeof obj.id !== 'string' || !obj.id) break;
             if(typeof obj.text !== 'string' || !obj.text.trim()) break;
@@ -488,6 +525,9 @@ function handleData(sock, buf, room){
           case 'typing':
             broadcast(room, JSON.stringify({ type:'typing', id: sock._cid, name: sock.name || '匿名', on: obj.on !== false }), sock);
             break;                                      // 不存储，仅转发
+          case 'raise_hand':   // 举手(会议场景)：不存储、实时转发给所有人(含发送者)，便于自身/他人都看到举手状态
+            broadcast(room, JSON.stringify({ type:'hand', id: sock._cid, name: sock.name || '匿名', on: obj.on !== false }));
+            break;
           case 'react':
             { // 即时表情回应(👍🎉…)：不落库、不受房间锁限制、不回显给发送者，仅实时转发给他人
               const emoji = (typeof obj.emoji === 'string') ? String(obj.emoji).slice(0, 8) : '';
@@ -502,6 +542,12 @@ function handleData(sock, buf, room){
             sock.avatar = String(obj.avatar || '').slice(0, 8) || sock.avatar;
             broadcast(room, JSON.stringify({ type:'avatar', id: sock._cid, avatar: sock.avatar }));  // 广播头像给他人(不落库)
             break;
+          case 'set_status':
+            {  // 设置自身在线状态(online/away/busy 或自定义短文本)，更新后广播 presence 给全员
+              const st = typeof obj.status === 'string' ? obj.status.trim().slice(0, 16) : '';
+              sock.status = st || 'online';
+              presence(room); break;
+            }
           case 'set_bg':
             if(room.owner && sock._cid !== room.owner){ sendFrame(sock, JSON.stringify({ type:'error', code:'not_owner', msg:'只有房主能设置背景' })); break; }
             const raw = obj.color;
@@ -546,7 +592,7 @@ function handleData(sock, buf, room){
               if(gap > 0){ sendFrame(sock, JSON.stringify({ type:'error', code:'slow_mode', msg:'发言过于频繁，请 ' + Math.ceil(gap/1000) + 's 后再试' })); break; }
               room._chatAt[sock._cid] = now;
             }
-            const chat = { type:'chat', id: sock._cid || '?', name: sock.name || '匿名', text: obj.text.slice(0, 500), t: Date.now(), mid: ++room._chatSeq };
+            const chat = { type:'chat', id: sock._cid || '?', name: sock.name || '匿名', text: obj.text.slice(0, 500), t: Date.now(), mid: ++room._chatSeq, reactions: {} };
             room.chats.push(chat);
             if(room.chats.length > 50) room.chats.shift();
             broadcast(room, JSON.stringify(chat), sock);   // 仅转发给他人
@@ -566,7 +612,85 @@ function handleData(sock, buf, room){
               sendFrame(sock, JSON.stringify({ type:'error', code:'no_such_chat', msg:'找不到该聊天消息' }));
             }
             break;
-          case 'request_snapshot': sendFrame(sock, JSON.stringify({ type:'snapshot', strokes: room.strokes, chats: room.chats })); break;
+          case 'react_chat': {   // 对聊天消息添加表情回应(按 mid 定位)，全员可见(含发送者)
+            if(typeof obj.emoji !== 'string' || typeof obj.mid !== 'number'){ sendFrame(sock, JSON.stringify({ type:'error', code:'bad_args', msg:'react_chat 需要 emoji 与数值 mid' })); break; }
+            const emoji = String(obj.emoji).slice(0, 8);
+            if(!emoji) break;
+            const ch = room.chats.find(c => c.mid === obj.mid);
+            if(!ch){ sendFrame(sock, JSON.stringify({ type:'error', code:'no_such_chat', msg:'找不到该聊天消息' })); break; }
+            ch.reactions = ch.reactions || {};
+            ch.reactions[emoji] = (ch.reactions[emoji] || 0) + 1;
+            broadcast(room, JSON.stringify({ type:'chat_react', mid: obj.mid, emoji, by: sock._cid, name: sock.name || '匿名', reactions: ch.reactions }));
+            store.saveRoom(room.name, room); break;
+          }
+          case 'edit_chat': {   // 编辑自己的聊天消息：按 mid 定位，仅作者可改，广播 chat_updated
+            if(typeof obj.text !== 'string' || typeof obj.mid !== 'number'){ sendFrame(sock, JSON.stringify({ type:'error', code:'bad_args', msg:'edit_chat 需要 text 与数值 mid' })); break; }
+            const ch = room.chats.find(c => c.mid === obj.mid);
+            if(!ch){ sendFrame(sock, JSON.stringify({ type:'error', code:'no_such_chat', msg:'找不到该聊天消息' })); break; }
+            if(ch.id !== sock._cid){ sendFrame(sock, JSON.stringify({ type:'error', code:'forbidden', msg:'只能编辑自己的消息' })); break; }
+            ch.text = obj.text.slice(0, 500);
+            ch.edited = true;
+            broadcast(room, JSON.stringify({ type:'chat_updated', mid: obj.mid, text: ch.text, edited: true, by: sock._cid, name: sock.name || '匿名' }));
+            store.saveRoom(room.name, room); break;
+          }
+          case 'create_poll': {   // 发起协作投票：question + 选项(≥2)，全员可见(含发起者)
+            const q = (typeof obj.question === 'string') ? String(obj.question).slice(0, 200) : '';
+            const opts = Array.isArray(obj.options) ? obj.options.map(o => String(o).slice(0, 80)).filter(Boolean).slice(0, 10) : [];
+            if(!q || opts.length < 2){ sendFrame(sock, JSON.stringify({ type:'error', code:'bad_args', msg:'create_poll 需要 question 与至少 2 个选项' })); break; }
+            const pid = ++room._pollSeq;
+            const poll = { pid, question: q, options: opts.map(t => ({ text: t, votes: 0 })), voters: {}, closed: false, author: sock._cid };
+            room.polls.push(poll);
+            broadcast(room, JSON.stringify({ type:'poll_created', poll: serializePoll(poll), by: sock._cid, name: sock.name || '匿名' }));
+            store.saveRoom(room.name, room); break;
+          }
+          case 'vote_poll': {     // 投票：按 pid + optionIndex 计票，允许改票(以最后一次为准)，全员可见
+            const pid = obj.pid, idx = obj.optionIndex;
+            const poll = room.polls.find(p => p.pid === pid);
+            if(!poll){ sendFrame(sock, JSON.stringify({ type:'error', code:'no_such_poll', msg:'找不到该投票' })); break; }
+            if(poll.closed){ sendFrame(sock, JSON.stringify({ type:'error', code:'poll_closed', msg:'投票已结束' })); break; }
+            if(!Number.isInteger(idx) || idx < 0 || idx >= poll.options.length){ sendFrame(sock, JSON.stringify({ type:'error', code:'bad_args', msg:'optionIndex 越界' })); break; }
+            poll.voters[sock._cid] = idx;
+            tallyPoll(poll);
+            broadcast(room, JSON.stringify({ type:'poll_updated', poll: serializePoll(poll) }));
+            store.saveRoom(room.name, room); break;
+          }
+          case 'close_poll': {    // 结束投票：仅发起者可关闭，关闭后不再计票
+            const pid = obj.pid;
+            const poll = room.polls.find(p => p.pid === pid);
+            if(!poll){ sendFrame(sock, JSON.stringify({ type:'error', code:'no_such_poll', msg:'找不到该投票' })); break; }
+            if(poll.author !== sock._cid){ sendFrame(sock, JSON.stringify({ type:'error', code:'forbidden', msg:'只有发起者可结束投票' })); break; }
+            poll.closed = true;
+            tallyPoll(poll);
+            broadcast(room, JSON.stringify({ type:'poll_updated', poll: serializePoll(poll), closed: true }));
+            store.saveRoom(room.name, room); break;
+          }
+          case 'create_timer': {   // 协作倒计时：label + 秒数，服务端权威计时(每秒 tick)，全员可见
+            const label = (typeof obj.label === 'string') ? String(obj.label).slice(0, 40).trim() : '';
+            const total = Math.max(1, Math.min(3600, Math.trunc(+obj.seconds || 0)));
+            if(!label || !total){ sendFrame(sock, JSON.stringify({ type:'error', code:'bad_args', msg:'create_timer 需要 label 与正整数 seconds' })); break; }
+            const tid = ++room._timerSeq;
+            const t = { tid, label, total, remaining: total, running: true, author: sock._cid };
+            room.timers.push(t);
+            broadcast(room, JSON.stringify({ type:'timer_created', timer: serializeTimer(t), by: sock._cid, name: sock.name || '匿名' }), sock);
+            store.saveRoom(room.name, room); break;
+          }
+          case 'timer_control': {   // 暂停/继续/重置/停止倒计时
+            const tid = obj.tid; const t = room.timers.find(x => x.tid === tid);
+            if(!t){ sendFrame(sock, JSON.stringify({ type:'error', code:'no_such_timer', msg:'找不到该计时器' })); break; }
+            const action = obj.action;
+            if(action === 'pause') t.running = false;
+            else if(action === 'resume') t.running = true;
+            else if(action === 'reset'){ t.remaining = t.total; t.running = false; }
+            else if(action === 'stop'){
+              room.timers = room.timers.filter(x => x.tid !== tid);
+              broadcast(room, JSON.stringify({ type:'timer_removed', tid }));
+              store.saveRoom(room.name, room); break;
+            }
+            else { sendFrame(sock, JSON.stringify({ type:'error', code:'bad_args', msg:'timer_control 需要 action: pause/resume/reset/stop' })); break; }
+            broadcast(room, JSON.stringify({ type:'timer_updated', timer: serializeTimer(t) }));
+            store.saveRoom(room.name, room); break;
+          }
+          case 'request_snapshot': sendFrame(sock, JSON.stringify({ type:'snapshot', strokes: room.strokes, chats: room.chats, polls: room.polls.map(serializePoll), timers: room.timers.map(serializeTimer) })); break;
           case 'room_list': sendFrame(sock, JSON.stringify({ type:'room_list', rooms: roomListPayload() })); break;
           case 'lock':
             if(sock._cid === room.owner){
@@ -865,3 +989,20 @@ function heartbeat(){
   }
 }
 setInterval(heartbeat, HB);
+
+// 倒计时驱动：每秒递减运行中的计时器剩余时间并广播 timer_tick；归零时停表并广播 timer_updated(finished)
+function tickTimers(){
+  for(const room of rooms.values()){
+    let changed = false;
+    for(const t of room.timers){
+      if(t.running && t.remaining > 0){
+        t.remaining--;
+        broadcast(room, JSON.stringify({ type:'timer_tick', tid: t.tid, remaining: t.remaining }));
+        changed = true;
+        if(t.remaining <= 0){ t.running = false; broadcast(room, JSON.stringify({ type:'timer_updated', timer: serializeTimer(t), finished: true })); }
+      }
+    }
+    if(changed) store.saveRoom(room.name, room);
+  }
+}
+setInterval(tickTimers, 1000);

@@ -54,11 +54,11 @@ node server.js
 
 ## 🧪 测试
 
-二十三 套端到端测试（手写 WS / HTTP 客户端，测试独立端口避免与本机其他服务争用 8080）：
+五十五 套端到端测试（手写 WS / HTTP 客户端，测试独立端口避免与本机其他服务争用 8080）：
 
 ```bash
 npm test
-# 二十八 套端到端测试（手写 WS / HTTP 客户端），共 262/262 通过：
+# 五十五 套端到端测试（手写 WS / HTTP 客户端），共 535/535 通过：
 # _store_test      (6/6)   房间磁盘持久化
 # _wb_text_test    (5/5)   文字工具 + 图形填充
 # _move_test       (6/6)   元素拖拽移动（稳定 id / 广播 / 快照平移）
@@ -87,6 +87,8 @@ npm test
 # _ping_test       (11/11) Ping 提醒：转发给他人 / 不回显自己 / 房主可见 / 不落库
 # _transfer_test   (8/8)   房主转移：owner 校验 / 广播 / 非房主被拒 / 无效目标被拒
 # _selectpresence_test (12/12) 远端选中态：select 广播 / 彩色虚框 / presence 离场清理
+# _edit_chat_test  (10/10) 编辑聊天：本人改字 / 广播 chat_updated / 越权被拒
+# _status_test     (9/9)   在线状态：presence 含 statuses / 自定义状态透传
 ```
 
 ## 🏗 架构
