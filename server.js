@@ -22,9 +22,28 @@ const rooms = new Map();
 function getRoom(name){
   let r = rooms.get(name);
   if(!r){
-    r = { clients: new Set(), strokes: [], chats: [], polls: [], timers: [], name, owner: null, locked: false, lockedElements: new Set(), muted: new Set(), banned: new Set(), bg: null, title: null, _chatSeq: 0, slowMode: 0, _pollSeq: 0, _timerSeq: 0, _chatAt: {} };
+    r = { clients: new Set(), strokes: [], chats: [], polls: [], timers: [], name, owner: null, locked: false, lockedElements: new Set(), muted: new Set(), banned: new Set(), bg: null, title: null, _chatSeq: 0, slowMode: 0, _pollSeq: 0, _timerSeq: 0, _chatAt: {},
+          followers: new Map(), views: new Map(), recording: null, _recorded: [], passwordHash: null, announcements: [], _announceAt: 0,
+          snapshots: {} };
     const saved = store.loadRoom(name);
-    if(saved){ r.strokes = saved.strokes; r.chats = saved.chats; if(typeof saved._chatSeq === 'number') r._chatSeq = saved._chatSeq; }
+    if(saved){
+      if(Array.isArray(saved.strokes)) r.strokes = saved.strokes;
+      if(Array.isArray(saved.chats)) r.chats = saved.chats;
+      if(typeof saved._chatSeq === 'number') r._chatSeq = saved._chatSeq;
+      if(typeof saved.bg === 'string') r.bg = saved.bg;
+      if(typeof saved.title === 'string') r.title = saved.title;
+      if(typeof saved.permissions === 'string') r.permissions = saved.permissions;
+      if(typeof saved.grid === 'boolean') r.grid = saved.grid;
+      if(typeof saved.snap === 'boolean') r.snap = saved.snap;
+      if(saved.lockedElements) r.lockedElements = new Set(saved.lockedElements);
+      if(saved.muted) r.muted = new Set(saved.muted);
+      if(saved.banned) r.banned = new Set(saved.banned);
+      if(Array.isArray(saved.polls)) r.polls = saved.polls;
+      if(Array.isArray(saved.timers)) r.timers = saved.timers;
+      if(saved.passwordHash) r.passwordHash = saved.passwordHash;
+      if(Array.isArray(saved.announcements)) r.announcements = saved.announcements;
+      if(saved.snapshots && typeof saved.snapshots === 'object') r.snapshots = saved.snapshots;
+    }
     rooms.set(name, r);
     hist.ensureHistory(r);
   }
@@ -33,13 +52,15 @@ function getRoom(name){
 
 function acceptKey(key){ return crypto.createHash('sha1').update(key + GUID).digest('base64'); }
 function sendFrame(sock, str){
+  if(!sock || sock.destroyed) return;   // 隐性问题：已断开的连接直接跳过，避免 write 抛错
   const payload = Buffer.from(str, 'utf8');
   const len = payload.length;
   let header;
   if(len < 126){ header = Buffer.from([0x81, len]); }
   else if(len < 65536){ header = Buffer.alloc(4); header[0]=0x81; header[1]=126; header.writeUInt16BE(len,2); }
   else { header = Buffer.alloc(10); header[0]=0x81; header[1]=127; header.writeBigUInt64BE(BigInt(len),2); }
-  sock.write(Buffer.concat([header, payload]));
+  try { sock.write(Buffer.concat([header, payload])); }
+  catch(e){ try { sock.destroy(); } catch(_){} }
 }
 function broadcast(room, str, except){
   for(const c of room.clients){ if(c !== except && !c.destroyed) sendFrame(c, str); }
@@ -73,6 +94,21 @@ function rotateElement(el, deg, cx, cy){
   }
   return el;
 }
+// 坐标/数值钳制：NaN/Infinity 归零，超出范围截断（防止非法坐标污染画板状态）
+function clampCoord(v, min, max){
+  const n = Number(v);
+  if(!Number.isFinite(n)) return 0;
+  return Math.max(min, Math.min(max, n));
+}
+// XML 转义（导出 SVG 时防止注入/解析失败）
+function escapeXml(s){
+  return String(s == null ? '' : s).replace(/[<>&'"]/g, c => ({ '<':'&lt;','>':'&gt;','&':'&amp;',"'":'&apos;','"':'&quot;' }[c]));
+}
+// 密码哈希：不存明文，仅存服务端加盐哈希（隐性问题：避免密码明文落盘/泄露）
+function hashPassword(pwd){
+  return crypto.createHash('sha256').update('collabboard::' + String(pwd)).digest('base64');
+}
+const MAX_MSG = 1 << 22;   // 单帧上限 4MB，防止超大帧导致内存膨胀(DoS)
 function presence(room){
   const names = [...room.clients].map(c => c.name || ('用户' + (c._cid || '?')));
   const ids = [...room.clients].map(c => c._cid);
@@ -145,6 +181,7 @@ function handleData(sock, buf, room){
     let maskKey;
     if(masked){ if(p+4 > buf.length) break; maskKey = buf.slice(p, p+4); p += 4; }
     if(p + len > buf.length) break;
+    if(len > MAX_MSG){ try { sock.destroy(); } catch(e){} return buf.slice(off); }   // 超大帧直接断连，防内存膨胀
     let payload = buf.slice(p, p+len);
     if(masked){ for(let i=0;i<len;i++) payload[i] ^= maskKey[i&3]; }
     off = p + len;
@@ -159,7 +196,7 @@ function handleData(sock, buf, room){
         try{
           let obj = JSON.parse(msg);
           // 房间锁定时，非房主的编辑类操作被拒绝（仅回错误给发起者，不广播、不入栈）
-          const EDIT_OPS = new Set(['stroke','text','image','note','move','replace','clear','undo','redo','duplicate','rotate','delete','pin','group','ungroup','align','comment']);
+          const EDIT_OPS = new Set(['stroke','text','image','note','move','replace','clear','undo','redo','duplicate','rotate','delete','pin','group','ungroup','align','comment','shape','frame','apply_template']);
           if(EDIT_OPS.has(obj.type)){
             if(room.locked && sock._cid !== room.owner){
               sendFrame(sock, JSON.stringify({ type:'error', code:'locked', msg:'房间已锁定，仅房主可编辑' }));
@@ -171,6 +208,11 @@ function handleData(sock, buf, room){
                 sendFrame(sock, JSON.stringify({ type:'error', code:'element_locked', msg:'该元素已被锁定，仅房主可编辑' }));
                 obj = { type:'__noop__' };
               }
+            }
+          }
+          if(room.recording && EDIT_OPS.has(obj.type)){
+            if(room.recording.ops.length < 5000){
+              try { room.recording.ops.push(JSON.parse(JSON.stringify(obj))); } catch(e){}  // 隐性问题：录制长度上限，防内存膨胀
             }
           }
           switch(obj.type){
@@ -504,7 +546,14 @@ function handleData(sock, buf, room){
               store.saveRoom(room.name, room);
             }
             break;
-          case 'cursor':  broadcast(room, msg, sock); break;       // 不存储，仅转发
+          case 'cursor':
+            broadcast(room, msg, sock);
+            if(room.followers && room.followers.has(sock._cid)){   // 隐性问题：follow 模式下把光标转发给关注者
+              for(const fid of room.followers.get(sock._cid)){
+                for(const c of room.clients){ if(c._cid === fid && c !== sock && !c.destroyed) sendFrame(c, msg); }
+              }
+            }
+            break;       // 不存储，仅转发
           case 'cursor_toggle':  // 显示/隐藏自己的光标，广播给他人（含 cid 与新的可见性）
             if(typeof obj.visible === 'boolean'){
               sock._cursorVisible = obj.visible;
@@ -705,7 +754,7 @@ function handleData(sock, buf, room){
             broadcast(room, JSON.stringify({ type:'timer_updated', timer: serializeTimer(t) }));
             store.saveRoom(room.name, room); break;
           }
-          case 'request_snapshot': sendFrame(sock, JSON.stringify({ type:'snapshot', strokes: room.strokes, chats: room.chats, polls: room.polls.map(serializePoll), timers: room.timers.map(serializeTimer) })); break;
+          case 'request_snapshot': sendFrame(sock, JSON.stringify({ type:'snapshot', strokes: room.strokes, chats: room.chats, polls: room.polls.map(serializePoll), timers: room.timers.map(serializeTimer), bg: room.bg, title: room.title, permissions: room.permissions || 'all', grid: !!room.grid, snap: !!room.snap, locked: !!room.locked, owner: room.owner })); break;  // 隐性问题：快照补齐房间元数据，迟到者/导出一致
           case 'room_list': sendFrame(sock, JSON.stringify({ type:'room_list', rooms: roomListPayload() })); break;
           case 'lock':
             if(sock._cid === room.owner){
@@ -1030,6 +1079,199 @@ function handleData(sock, buf, room){
             { room.snap = obj.on === true ? true : (obj.on === false ? false : !room.snap);
               broadcast(room, JSON.stringify({ type:'snap_toggle', on: !!room.snap, by: room.owner })); }
             break;
+          case 'shape':   // 矢量图形基本图元：rect/ellipse/line/triangle（持久化、可撤销、受房间锁/元素锁约束）
+            {
+              const kind = (typeof obj.kind === 'string') ? obj.kind : '';
+              if(!['rect','ellipse','line','triangle'].includes(kind)){ sendFrame(sock, JSON.stringify({ type:'error', code:'bad_kind', msg:'shape 需要 kind: rect/ellipse/line/triangle' })); break; }
+              const x = clampCoord(obj.x, -100000, 100000), y = clampCoord(obj.y, -100000, 100000);
+              const w = Math.max(1, Math.min(20000, +obj.w||100));
+              const h = Math.max(1, Math.min(20000, +obj.h||100));
+              const color = (typeof obj.color === 'string' && /^#[0-9a-fA-F]{6}$/.test(obj.color)) ? obj.color : '#ffffff';
+              const fill = (typeof obj.fill === 'string' && /^#[0-9a-fA-F]{6}$/.test(obj.fill)) ? obj.fill : null;
+              const sh = { type:'shape', shapeKind: kind, id: obj.id != null ? obj.id : (sock._cid + ':' + (++strokeSeq)),
+                x, y, w, h, color, fill, author: sock._cid, authorColor: sock.color };
+              hist.commitStrokes(room, room.strokes.concat(sh)); broadcast(room, JSON.stringify(sh), sock);
+              store.saveRoom(room.name, room);
+            }
+            break;
+          case 'frame':   // 画布分区/框：带标题的分组容器（持久化、可撤销、受房间锁约束）
+            {
+              const label = typeof obj.label === 'string' ? obj.label.slice(0, 40).trim() : '';
+              if(!label){ sendFrame(sock, JSON.stringify({ type:'error', code:'bad_label', msg:'frame 需要 label' })); break; }
+              const x = clampCoord(obj.x, -100000, 100000), y = clampCoord(obj.y, -100000, 100000);
+              const w = Math.max(20, Math.min(20000, +obj.w||320));
+              const h = Math.max(20, Math.min(20000, +obj.h||240));
+              const color = (typeof obj.color === 'string' && /^#[0-9a-fA-F]{6}$/.test(obj.color)) ? obj.color : '#82aaff';
+              const fr = { type:'frame', id: obj.id != null ? obj.id : (sock._cid + ':' + (++strokeSeq)),
+                x, y, w, h, label, color, author: sock._cid, authorColor: sock.color };
+              hist.commitStrokes(room, room.strokes.concat(fr)); broadcast(room, JSON.stringify(fr), sock);
+              store.saveRoom(room.name, room);
+            }
+            break;
+          case 'measure':   // 测量两点距离（瞬时、不持久化、不受房间锁限制）
+            {
+              const ax = +obj.ax, ay = +obj.ay, bx = +obj.bx, by = +obj.by;
+              if(!Number.isFinite(ax) || !Number.isFinite(ay) || !Number.isFinite(bx) || !Number.isFinite(by)) break;  // 隐性问题：非法坐标直接忽略，不广播 NaN
+              const dist = Math.hypot(bx - ax, by - ay);
+              if(!Number.isFinite(dist)) break;
+              broadcast(room, JSON.stringify({ type:'measure', from: sock._cid, name: sock.name || '匿名', ax, ay, bx, by, dist: Math.round(dist*100)/100 }), sock);
+            }
+            break;
+          case 'follow':   // 关注某成员：实时转发对方光标（维护 room.followers 映射，离场自动清理）
+            {
+              const target = (typeof obj.toId === 'string') ? obj.toId : '';
+              room.followers = room.followers || new Map();
+              for(const [cid, set] of room.followers){ set.delete(sock._cid); if(set.size === 0) room.followers.delete(cid); }  // 先清除旧关注关系
+              if(target && target !== sock._cid){
+                let t = null; for(const c of room.clients){ if(c._cid === target){ t = c; break; } }
+                if(!t){ sendFrame(sock, JSON.stringify({ type:'error', code:'no_such_user', msg:'follow 目标不在房间内' })); break; }
+                if(!room.followers.has(target)) room.followers.set(target, new Set());
+                room.followers.get(target).add(sock._cid);
+                broadcast(room, JSON.stringify({ type:'follow', from: sock._cid, name: sock.name || '匿名', toId: target }), sock);
+              } else {
+                broadcast(room, JSON.stringify({ type:'follow_stop', from: sock._cid }), sock);
+              }
+            }
+            break;
+          case 'save_view':   // 保存个人视口（x/y/zoom），便于协作跳转；广播给他人
+            {
+              const x = +obj.x||0, y = +obj.y||0, zoom = Math.max(0.1, Math.min(8, +obj.zoom||1));
+              room.views = room.views || new Map();
+              room.views.set(sock._cid, { x, y, zoom, name: sock.name || '匿名', t: Date.now() });
+              broadcast(room, JSON.stringify({ type:'view_saved', id: sock._cid, name: sock.name || '匿名', x, y, zoom }), sock);
+            }
+            break;
+          case 'load_view':   // 读取某成员(或自己)保存的视口
+            {
+              const id = (typeof obj.id === 'string') ? obj.id : sock._cid;
+              room.views = room.views || new Map();
+              const v = room.views.get(id);
+              if(!v){ sendFrame(sock, JSON.stringify({ type:'error', code:'no_view', msg:'没有该用户的视图' })); break; }
+              sendFrame(sock, JSON.stringify({ type:'view', id, x: v.x, y: v.y, zoom: v.zoom, by: id }));
+            }
+            break;
+          case 'resolve_comment':   // 解决/取消解决某元素的评论（按 index 或整条），广播并持久化
+            {
+              if(typeof obj.id !== 'string' || !obj.id){ sendFrame(sock, JSON.stringify({ type:'error', code:'bad_id', msg:'resolve_comment 需要元素 id' })); break; }
+              const idx = (typeof obj.index === 'number') ? obj.index : -1;
+              const el = room.strokes.find(s => s && s.id === obj.id);
+              if(!el){ sendFrame(sock, JSON.stringify({ type:'error', code:'no_such_element', msg:'评论的元素不存在' })); break; }
+              if(!Array.isArray(el.comments) || el.comments.length === 0){ sendFrame(sock, JSON.stringify({ type:'error', code:'no_comment', msg:'该元素没有评论' })); break; }
+              if(idx >= 0){
+                if(idx >= el.comments.length){ sendFrame(sock, JSON.stringify({ type:'error', code:'bad_index', msg:'评论索引越界' })); break; }
+                el.comments[idx].resolved = obj.resolved !== false;
+              } else {
+                for(const c of el.comments) c.resolved = obj.resolved !== false;
+              }
+              broadcast(room, JSON.stringify({ type:'comment_resolved', id: obj.id, index: idx, resolved: obj.resolved !== false }));
+              store.saveRoom(room.name, room);
+            }
+            break;
+          case 'board_stats':   // 看板统计：各元素类型计数 + 在线/锁定等（便于观察房间规模与可观测性）
+            {
+              const count = (t)=> room.strokes.filter(s => s && s.type === t).length;
+              const stats = {
+                type:'board_stats',
+                strokes: room.strokes.length,
+                shapes: count('shape'), frames: count('frame'), texts: count('text'),
+                notes: count('note'), images: count('image'), pins: count('pin'), stamps: count('stamp'),
+                comments: room.strokes.reduce((a,s)=> a + (Array.isArray(s.comments)?s.comments.length:0), 0),
+                chats: room.chats.length, polls: room.polls.length, timers: room.timers.length,
+                clients: room.clients.size,
+                lockedElements: (room.lockedElements && room.lockedElements.size) || 0,
+                locked: !!room.locked, password: !!room.passwordHash
+              };
+              sendFrame(sock, JSON.stringify(stats));
+            }
+            break;
+          case 'apply_template':   // 应用内置模板（白板/四象限），仅允许名单内模板，避免任意元素注入；可撤销
+            {
+              const name = (typeof obj.name === 'string') ? obj.name : '';
+              const TEMPLATES = {
+                brain: [ {type:'frame', x:40,y:40,w:360,h:240,label:'想法',color:'#82aaff'},
+                         {type:'frame', x:440,y:40,w:360,h:240,label:'方案',color:'#7ee787'},
+                         {type:'frame', x:40,y:320,w:360,h:240,label:'风险',color:'#f07178'},
+                         {type:'frame', x:440,y:320,w:360,h:240,label:'行动',color:'#ffcb6b'} ],
+                grid4: [ {type:'frame', x:40,y:40,w:300,h:200,label:'1',color:'#add7ff'},
+                         {type:'frame', x:380,y:40,w:300,h:200,label:'2',color:'#add7ff'},
+                         {type:'frame', x:40,y:280,w:300,h:200,label:'3',color:'#add7ff'},
+                         {type:'frame', x:380,y:280,w:300,h:200,label:'4',color:'#add7ff'} ]
+              };
+              const tpl = TEMPLATES[name];
+              if(!tpl){ sendFrame(sock, JSON.stringify({ type:'error', code:'bad_template', msg:'未知模板：' + name })); break; }
+              const news = tpl.map(el => Object.assign({}, el, { id: sock._cid + ':' + (++strokeSeq), author: sock._cid, authorColor: sock.color }));
+              hist.commitStrokes(room, room.strokes.concat(news));
+              broadcast(room, JSON.stringify({ type:'replace', strokes: room.strokes }), sock);
+              store.saveRoom(room.name, room);
+            }
+            break;
+          case 'set_password':   // 房主设置/清除房间密码（仅存哈希，握手阶段校验，不泄露明文）
+            {
+              if(sock._cid !== room.owner){ sendFrame(sock, JSON.stringify({ type:'error', code:'not_owner', msg:'只有房主能设置密码' })); break; }
+              const pwd = (typeof obj.password === 'string') ? obj.password : '';
+              if(pwd.length > 0 && pwd.length < 4){ sendFrame(sock, JSON.stringify({ type:'error', code:'weak_password', msg:'密码至少 4 位' })); break; }
+              room.passwordHash = pwd ? hashPassword(pwd) : null;
+              broadcast(room, JSON.stringify({ type:'password_set', set: !!room.passwordHash, by: room.owner }));
+              store.saveRoom(room.name, room);
+            }
+            break;
+          case 'record_start':   // 房主开始录制编辑操作（录制上限 5000 条，防内存膨胀）
+            if(sock._cid !== room.owner){ sendFrame(sock, JSON.stringify({ type:'error', code:'not_owner', msg:'只有房主能录制' })); break; }
+            room.recording = { ops: [], start: Date.now() };
+            broadcast(room, JSON.stringify({ type:'record_started', by: room.owner }));
+            break;
+          case 'record_stop':   // 房主停止录制，保留录制内容用于回放
+            if(sock._cid !== room.owner){ sendFrame(sock, JSON.stringify({ type:'error', code:'not_owner', msg:'只有房主能停止录制' })); break; }
+            if(!room.recording){ sendFrame(sock, JSON.stringify({ type:'error', code:'not_recording', msg:'当前未在录制' })); break; }
+            room._recorded = room.recording.ops.slice(0, 5000);
+            room.recording = null;
+            broadcast(room, JSON.stringify({ type:'record_stopped', count: room._recorded.length, by: room.owner }));
+            break;
+          case 'playback':   // 房主回放录制：重发录制的编辑操作，便于复盘
+            if(sock._cid !== room.owner){ sendFrame(sock, JSON.stringify({ type:'error', code:'not_owner', msg:'只有房主能回放' })); break; }
+            if(!room._recorded || room._recorded.length === 0){ sendFrame(sock, JSON.stringify({ type:'error', code:'nothing_recorded', msg:'没有可回放的录制' })); break; }
+            for(const op of room._recorded) broadcast(room, JSON.stringify(op));
+            sendFrame(sock, JSON.stringify({ type:'playback_done', count: room._recorded.length }));
+            break;
+          case 'announce':   // 房主发布公告（全员可见，限频 1.5s 防刷屏，持久化）
+            {
+              if(sock._cid !== room.owner){ sendFrame(sock, JSON.stringify({ type:'error', code:'not_owner', msg:'只有房主能发布公告' })); break; }
+              if(typeof obj.text !== 'string' || !obj.text.trim()){ sendFrame(sock, JSON.stringify({ type:'error', code:'bad_text', msg:'announce 需要文本' })); break; }
+              room._announceAt = room._announceAt || 0;
+              const now = Date.now();
+              if(now - room._announceAt < 1500){ sendFrame(sock, JSON.stringify({ type:'error', code:'rate_limited', msg:'公告过于频繁' })); break; }  // 隐性问题：限频
+              room._announceAt = now;
+              const a = { type:'announce', text: obj.text.slice(0, 200), by: room.owner, name: sock.name || '匿名', t: now };
+              broadcast(room, JSON.stringify(a));
+              room.announcements = room.announcements || [];
+              room.announcements.push(a);
+              if(room.announcements.length > 20) room.announcements.shift();
+              store.saveRoom(room.name, room);
+            }
+            break;
+          case 'export_board':   // 导出整板：json 或 svg 格式，含完整房间元数据（一致性校验）
+            {
+              const fmt = (typeof obj.format === 'string') ? obj.format : 'json';
+              if(fmt !== 'json' && fmt !== 'svg'){ sendFrame(sock, JSON.stringify({ type:'error', code:'bad_format', msg:'export 仅支持 json/svg' })); break; }
+              if(fmt === 'json'){
+                const data = { name: room.name, bg: room.bg, title: room.title, permissions: room.permissions || 'all',
+                  grid: !!room.grid, snap: !!room.snap, locked: !!room.locked,
+                  strokes: room.strokes, chats: room.chats,
+                  polls: room.polls.map(serializePoll), timers: room.timers.map(serializeTimer) };
+                sendFrame(sock, JSON.stringify({ type:'board_export', format:'json', data }));
+              } else {
+                let svg = '<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="800">';
+                if(room.bg) svg += '<rect width="100%" height="100%" fill="'+room.bg+'"/>';
+                for(const el of room.strokes){
+                  if(el.type === 'frame' || el.shapeKind === 'rect' || el.shapeKind === 'triangle'){ svg += '<rect x="'+clampCoord(el.x,0,1e6)+'" y="'+clampCoord(el.y,0,1e6)+'" width="'+clampCoord(el.w,0,1e6)+'" height="'+clampCoord(el.h,0,1e6)+'" fill="'+(el.fill||'none')+'" stroke="'+el.color+'"/>'; }
+                  else if(el.shapeKind === 'ellipse'){ svg += '<ellipse cx="'+(clampCoord(el.x,0,1e6)+clampCoord(el.w,0,1e6)/2)+'" cy="'+(clampCoord(el.y,0,1e6)+clampCoord(el.h,0,1e6)/2)+'" rx="'+(clampCoord(el.w,0,1e6)/2)+'" ry="'+(clampCoord(el.h,0,1e6)/2)+'" fill="none" stroke="'+el.color+'"/>'; }
+                  else if(el.type === 'text'){ svg += '<text x="'+clampCoord(el.x,0,1e6)+'" y="'+clampCoord(el.y,0,1e6)+'" fill="'+el.color+'">'+escapeXml(el.text)+'</text>'; }
+                }
+                svg += '</svg>';
+                sendFrame(sock, JSON.stringify({ type:'board_export', format:'svg', svg, length: svg.length }));
+              }
+            }
+            break;
         }
       }catch(e){ /* ignore */ }
     }
@@ -1053,6 +1295,7 @@ const server = net.createServer(sock=>{
       if(reqLine){
         const u = new URL(reqLine[1], 'http://x');
         roomName = u.searchParams.get('room') || 'main';
+        sock._pwd = u.searchParams.get('pwd') || '';
       }
       const m = head.match(/Sec-WebSocket-Key:\s*(.+)\r\n/);
       if(!m){ sock.end(); return; }
@@ -1065,6 +1308,12 @@ const server = net.createServer(sock=>{
       );
       handshakeDone = true;
       const room = getRoom(roomName);
+      if(room.passwordHash){                  // 隐性问题：密码房需在握手阶段校验，未带/错误密码拒绝加入
+        if(hashPassword(sock._pwd || '') !== room.passwordHash){
+          sendFrame(sock, JSON.stringify({ type:'error', code:'unauthorized', msg:'房间已设置密码' }));
+          sock.end(); return;
+        }
+      }
       const _rc = (head.match(/[?&]cid=([a-z0-9]{1,12})/i) || [])[1];
       sock._cid = _rc || Math.random().toString(36).slice(2, 8);
       sock.name = null;
@@ -1093,6 +1342,11 @@ const server = net.createServer(sock=>{
   function onLeave(s){
     const room = s.room; if(!room) return;
     room.clients.delete(s);
+    if(room.followers){                       // 隐性问题：清理离开者的 follow 关系，避免悬空引用
+      room.followers.delete(s._cid);
+      for(const set of room.followers.values()) set.delete(s._cid);
+    }
+    if(room.views) room.views.delete(s._cid);
     // 房主离开则提拔下一位客户端为房主并解锁，避免房间被永久锁死
     if(room.owner === s._cid && room.clients.size > 0){
       room.owner = room.clients.values().next().value._cid;
