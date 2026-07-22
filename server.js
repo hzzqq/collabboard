@@ -175,6 +175,7 @@ function handleData(sock, buf, room){
           }
           switch(obj.type){
           case 'stroke':
+            if(room.permissions && room.permissions !== 'all' && sock._cid !== room.owner){ sendFrame(sock, JSON.stringify({ type:'error', code:'no_edit_permission', msg:'当前权限下你无法编辑画板' })); break; }
             if(obj.stroke && typeof obj.stroke === 'object'){
               if(obj.stroke.id == null) obj.stroke.id = sock._cid + ':' + (++strokeSeq);  // 保留客户端 id；否则服务端生成
               obj.stroke.author = sock._cid;          // 服务端权威署名，覆盖客户端伪造
@@ -504,6 +505,12 @@ function handleData(sock, buf, room){
             }
             break;
           case 'cursor':  broadcast(room, msg, sock); break;       // 不存储，仅转发
+          case 'cursor_toggle':  // 显示/隐藏自己的光标，广播给他人（含 cid 与新的可见性）
+            if(typeof obj.visible === 'boolean'){
+              sock._cursorVisible = obj.visible;
+              broadcast(room, JSON.stringify({ type:'cursor_toggle', cid: sock._cid, visible: obj.visible }), sock);
+            }
+            break;
           case 'ping':    // 元素提醒：广播给其他人（带作者名/色），不落库、不受房间锁限制
             if(typeof obj.id === 'string' && obj.id){
               broadcast(room, JSON.stringify({ type:'ping', id: obj.id, author: sock._cid, name: sock.name || '匿名', color: sock.color }), sock);
@@ -548,6 +555,14 @@ function handleData(sock, buf, room){
               sock.status = st || 'online';
               presence(room); break;
             }
+          case 'set_permissions': {   // 房主设置编辑权限：all(默认) / host-only(仅房主可画) / view(仅房主可画，等同只读)
+            if(sock._cid !== room.owner){ sendFrame(sock, JSON.stringify({ type:'error', code:'not_owner', msg:'仅房主可设置编辑权限' })); break; }
+            const mode = typeof obj.mode === 'string' ? obj.mode : '';
+            if(mode !== 'all' && mode !== 'host-only' && mode !== 'view'){ sendFrame(sock, JSON.stringify({ type:'error', code:'bad_mode', msg:'mode 须为 all / host-only / view' })); break; }
+            room.permissions = mode;
+            broadcast(room, JSON.stringify({ type:'permissions', permissions: mode, by: room.owner }));
+            store.saveRoom(room.name, room); break;
+          }
           case 'set_bg':
             if(room.owner && sock._cid !== room.owner){ sendFrame(sock, JSON.stringify({ type:'error', code:'not_owner', msg:'只有房主能设置背景' })); break; }
             const raw = obj.color;
@@ -898,6 +913,122 @@ function handleData(sock, buf, room){
               if(c._cid === room.owner) continue;
               try { c.destroy(); } catch(e){}
             }
+            break;
+          case 'save_snapshot':   // 房主把当前画板元素存为命名快照（内存 + 持久化 saveRoom）
+            if(sock._cid !== room.owner){
+              sendFrame(sock, JSON.stringify({ type:'error', code:'not_owner', msg:'只有房主能保存快照' }));
+              break;
+            }
+            { const name = (typeof obj.name === 'string') ? obj.name.trim() : '';
+              if(!name){ sendFrame(sock, JSON.stringify({ type:'error', code:'bad_name', msg:'save_snapshot 需要 name' })); break; }
+              room.snapshots = room.snapshots || {};
+              room.snapshots[name] = Array.isArray(room.strokes) ? room.strokes.slice() : [];
+              broadcast(room, JSON.stringify({ type:'snapshot_saved', name, count: room.snapshots[name].length, by: room.owner }));
+              store.saveRoom(room.name, room); }
+            break;
+          case 'list_snapshots':   // 返回已有快照名列表（含各快照元素数），任何人可查
+            { room.snapshots = room.snapshots || {};
+              const names = Object.keys(room.snapshots).map(n => ({ name:n, count:(room.snapshots[n]||[]).length }));
+              sendFrame(sock, JSON.stringify({ type:'snapshot_list', snapshots: names })); }
+            break;
+          case 'voice_signal':   // WebRTC 信令中转：仅转发给 to 指定的客户端，不广播
+            { const to = obj.to;
+              if(typeof to !== 'string' || !to){
+                sendFrame(sock, JSON.stringify({ type:'error', code:'bad_to', msg:'voice_signal 需要 to(目标 cid)' }));
+                break;
+              }
+              let vtarget = null;
+              for(const c of room.clients){ if(c._cid === to){ vtarget = c; break; } }
+              if(!vtarget){
+                sendFrame(sock, JSON.stringify({ type:'error', code:'no_such_user', msg:'voice_signal 目标不在房间内' }));
+                break;
+              }
+              sendFrame(vtarget, JSON.stringify({ type:'voice_signal', from: sock._cid, signal: obj.signal || null })); }
+            break;
+          case 'mute_user':   // 房主禁言指定用户：room.muted.add(cid)，广播 {type:'muted', cid}
+            if(sock._cid !== room.owner){
+              sendFrame(sock, JSON.stringify({ type:'error', code:'not_owner', msg:'只有房主能禁言' }));
+              break;
+            }
+            { const to = obj.toId;
+              if(typeof to !== 'string' || !to){
+                sendFrame(sock, JSON.stringify({ type:'error', code:'bad_to', msg:'mute_user 需要 toId' }));
+                break;
+              }
+              if(to === room.owner){
+                sendFrame(sock, JSON.stringify({ type:'error', code:'mute_self', msg:'不能禁言房主本人' }));
+                break;
+              }
+              let mt = null; for(const c of room.clients){ if(c._cid === to){ mt = c; break; } }
+              if(!mt){
+                sendFrame(sock, JSON.stringify({ type:'error', code:'no_such_user', msg:'目标用户不在房间内' }));
+                break;
+              }
+              room.muted.add(to);
+              room.muted[to] = true;   // 显式置属性位，兼容按对象访问
+              broadcast(room, JSON.stringify({ type:'muted', cid: to, by: room.owner })); }
+            break;
+          case 'clear_layer':   // 清空指定图层：房主或该层作者可操作，移除 layerId 匹配的元素
+            { const layerId = obj.layerId;
+              if(typeof layerId !== 'string' || !layerId){
+                sendFrame(sock, JSON.stringify({ type:'error', code:'bad_layer', msg:'clear_layer 需要 layerId' }));
+                break;
+              }
+              const authors = new Set(room.strokes.filter(el => el && el.layerId === layerId).map(el => el.author));
+              if(sock._cid !== room.owner && !authors.has(sock._cid)){
+                sendFrame(sock, JSON.stringify({ type:'error', code:'not_owner', msg:'只有房主或该层作者能清空图层' }));
+                break;
+              }
+              const before = room.strokes.length;
+              room.strokes = room.strokes.filter(el => !(el && el.layerId === layerId));
+              const removed = before - room.strokes.length;
+              if(removed > 0){
+                hist.commitStrokes(room, room.strokes);
+                broadcast(room, JSON.stringify({ type:'layer_cleared', layerId, by: sock._cid, removed }));
+                store.saveRoom(room.name, room);
+              } else {
+                sendFrame(sock, JSON.stringify({ type:'ok', op:'clear_layer', removed: 0 }));
+              } }
+            break;
+          case 'lock_board':   // 房主切换整板锁定，广播 {type:'board_locked', locked}
+            if(sock._cid !== room.owner){
+              sendFrame(sock, JSON.stringify({ type:'error', code:'not_owner', msg:'只有房主能锁定整板' }));
+              break;
+            }
+            { room.locked = !room.locked;
+              broadcast(room, JSON.stringify({ type:'board_locked', locked: room.locked, by: room.owner }));
+              store.saveRoom(room.name, room); }
+            break;
+          case 'lock_layer':   // 房主锁定/解锁某图层：room.lockedLayers Set，广播
+            if(sock._cid !== room.owner){
+              sendFrame(sock, JSON.stringify({ type:'error', code:'not_owner', msg:'只有房主能锁定图层' }));
+              break;
+            }
+            { const layerId = obj.layerId;
+              if(typeof layerId !== 'string' || !layerId){
+                sendFrame(sock, JSON.stringify({ type:'error', code:'bad_layer', msg:'lock_layer 需要 layerId' }));
+                break;
+              }
+              room.lockedLayers = room.lockedLayers || new Set();
+              const locked = obj.locked !== false;   // 默认锁定（locked:false 表示解锁）
+              if(locked) room.lockedLayers.add(layerId); else room.lockedLayers.delete(layerId);
+              broadcast(room, JSON.stringify({ type:'layer_locked', layerId, locked, by: room.owner })); }
+            break;
+          case 'grid_toggle':   // 房主切换网格显示：room.grid 布尔，广播
+            if(sock._cid !== room.owner){
+              sendFrame(sock, JSON.stringify({ type:'error', code:'not_owner', msg:'只有房主能切换网格' }));
+              break;
+            }
+            { room.grid = obj.on === true ? true : (obj.on === false ? false : !room.grid);
+              broadcast(room, JSON.stringify({ type:'grid_toggle', on: !!room.grid, by: room.owner })); }
+            break;
+          case 'snap_toggle':   // 房主切换吸附网格：room.snap 布尔，广播
+            if(sock._cid !== room.owner){
+              sendFrame(sock, JSON.stringify({ type:'error', code:'not_owner', msg:'只有房主能切换吸附' }));
+              break;
+            }
+            { room.snap = obj.on === true ? true : (obj.on === false ? false : !room.snap);
+              broadcast(room, JSON.stringify({ type:'snap_toggle', on: !!room.snap, by: room.owner })); }
             break;
         }
       }catch(e){ /* ignore */ }
