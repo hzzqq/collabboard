@@ -5,6 +5,13 @@
 <title>CollabBoard · 实时协作白板</title>
 <style>
   :root{ --bg:#0a0c10; --panel:#12161d; --line:#1f2730; --txt:#cdd6e0; --accent:#f78c6c; }
+  .reactBtn{ background:#1b212b; color:#cdd6e0; border:1px solid var(--line); border-radius:6px;
+    font-size:15px; line-height:1; padding:3px 6px; cursor:pointer; }
+  .reactBtn:hover{ background:#243040; }
+  #reactLayer .react-pop{ position:absolute; left:50%; top:42%; transform:translate(-50%,-50%) scale(1);
+    font-size:64px; filter:drop-shadow(0 2px 8px rgba(0,0,0,.5)); animation:reactIn .25s ease-out; }
+  #reactLayer .react-pop.fade{ opacity:0; transform:translate(-50%,-90%) scale(1.25); transition:opacity .6s, transform .6s; }
+  @keyframes reactIn{ from{ opacity:0; transform:translate(-50%,-30%) scale(.4);} to{ opacity:1; transform:translate(-50%,-50%) scale(1);} }
   *{box-sizing:border-box;}
   html,body{margin:0;height:100%;background:var(--bg);color:var(--txt);
     font-family:ui-monospace,Menlo,Consolas,monospace;overflow:hidden;}
@@ -95,6 +102,9 @@
       <label style="margin-top:8px;font-size:11px;color:#6b7888;">板背景(房主)</label>
       <input type="color" id="bgColor" value="#0e1118" />
       <button id="setBgBtn">🎨 设为背景</button>
+      <label style="margin-top:8px;font-size:11px;color:#6b7888;">看板标题(房主)</label>
+      <input type="text" id="boardTitle" placeholder="未命名看板" maxlength="80" style="width:140px;" />
+      <button id="setTitleBtn">🏷 设标题</button>
       <button id="ungroupBtn">🔓 解组选中</button>
       <button id="pingBtn">🔔 提醒选中</button>
     </div>
@@ -203,12 +213,22 @@
     <h2>聊天</h2>
     <div id="chatLog"></div>
     <div id="typing" class="sys"></div>
+    <div id="reactBar" style="margin:6px 0; display:flex; gap:4px; flex-wrap:wrap;">
+      <span style="font-size:11px;color:#6b7888;align-self:center;">回应:</span>
+      <button class="reactBtn" data-emoji="👍">👍</button>
+      <button class="reactBtn" data-emoji="❤️">❤️</button>
+      <button class="reactBtn" data-emoji="😂">😂</button>
+      <button class="reactBtn" data-emoji="🎉">🎉</button>
+      <button class="reactBtn" data-emoji="👀">👀</button>
+      <button class="reactBtn" data-emoji="🔥">🔥</button>
+    </div>
     <div id="chatInput">
       <input type="text" id="chatText" placeholder="说点什么…(回车发送)" maxlength="500" />
       <button id="chatSend">发送</button>
     </div>
   </div>
 </div>
+<div id="reactLayer" style="position:fixed; inset:0; pointer-events:none; z-index:50;"></div>
 <script src="svg.js"></script>
 <script src="grid.js"></script>
 <script>
@@ -690,6 +710,7 @@ $('groupBtn').onclick = groupSel;
 $('lockElBtn').onclick = lockSel;
 $('unlockElBtn').onclick = unlockSel;
 $('setBgBtn').onclick = ()=> send({ type:'set_bg', color: $('bgColor').value });
+$('setTitleBtn').onclick = ()=> send({ type:'set_title', title: $('boardTitle').value });
 function ungroupSel(){ if(selectedIds.size === 0) return; send({ type:'ungroup', ids:[...selectedIds] }); for(const s of strokes){ if(s && selectedIds.has(s.id)) delete s.group; } redraw(); }
 $('ungroupBtn').onclick = ungroupSel;
 $('pingBtn').onclick = pingSel;
@@ -769,6 +790,19 @@ function addChat(text, who, isSys){
   log.appendChild(div);
   log.scrollTop = log.scrollHeight;
 }
+// 即时表情回应：在画布中央短暂浮出一个大号 emoji，自动淡出（不落库、纯在场反馈）
+function showReaction(emoji, name, color){
+  const layer = $('reactLayer');
+  if(!layer) return;
+  const el = document.createElement('div');
+  el.className = 'react-pop';
+  el.textContent = emoji;
+  el.style.color = color;
+  el.title = (name || '') + ' 回应了 ' + emoji;
+  layer.appendChild(el);
+  setTimeout(()=>{ el.classList.add('fade'); }, 900);
+  setTimeout(()=>{ if(el.parentNode) el.parentNode.removeChild(el); }, 1600);
+}
 function renderRoster(names){
   const r = $('roster'); r.innerHTML = '';
   $('online').textContent = names.length;
@@ -826,6 +860,10 @@ $('chatText').addEventListener('input', ()=>{
 $('chatText').addEventListener('blur', ()=> sendTyping(false));
 $('chatSend').onclick = sendChat;
 $('chatText').addEventListener('keydown', e=>{ if(e.key==='Enter'){ e.preventDefault(); sendChat(); } });
+// 即时表情回应：点击任一 emoji 即广播给房间内其他人（不落库）
+document.querySelectorAll('.reactBtn').forEach(b=>{
+  b.onclick = ()=> send({ type:'react', emoji: b.getAttribute('data-emoji') });
+});
 
 // ---------- WebSocket 同步 ----------
 let ws = null, online = 1, lastCursor = 0;
@@ -913,6 +951,9 @@ function connect(){
       case 'typing':
         if(m.id !== myId){ $('typing').textContent = (m.on ? ((m.name || '某人') + ' 正在输入…') : ''); }
         break;
+      case 'react':
+        if(m.id !== myId) showReaction(m.emoji, m.name || '某人', m.color || '#888');
+        break;
       case 'presence':
         $('online').textContent = m.count;
         if(Array.isArray(m.names)) renderRoster(m.names);
@@ -934,6 +975,10 @@ function connect(){
         break;
       case 'bg':
         if(cv) cv.style.background = m.color || '#0e1118';
+        break;
+      case 'title':
+        if($('boardTitle')) $('boardTitle').value = m.title || '';
+        document.title = (m.title ? m.title + ' · ' : '') + 'CollabBoard';
         break;
       case 'error':
         addChat('⚠ ' + (m.msg || '操作被拒绝'), '', true); break;
@@ -964,6 +1009,8 @@ function updateLockUI(){
   $('unlockElBtn').style.opacity = (!me || selectedIds.size === 0) ? .45 : 1;
   $('setBgBtn').disabled = !me;
   $('setBgBtn').style.opacity = me ? 1 : .45;
+  $('setTitleBtn').disabled = !me;
+  $('setTitleBtn').style.opacity = me ? 1 : .45;
 }
 $('lockBtn').onclick = ()=> send({ type:'lock' });
 $('unlockBtn').onclick = ()=> send({ type:'unlock' });
