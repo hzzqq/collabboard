@@ -22,9 +22,9 @@ const rooms = new Map();
 function getRoom(name){
   let r = rooms.get(name);
   if(!r){
-    r = { clients: new Set(), strokes: [], chats: [], polls: [], timers: [], name, owner: null, locked: false, lockedElements: new Set(), muted: new Set(), banned: new Set(), bg: null, title: null, _chatSeq: 0, slowMode: 0, _pollSeq: 0, _timerSeq: 0, _chatAt: {},
+    r = { clients: new Set(), strokes: [], chats: [], polls: [], timers: [], name, owner: null, locked: false, lockedElements: new Set(), muted: new Set(), banned: new Set(), bg: null, title: null, _chatSeq: 0, slowMode: 0, _pollSeq: 0, _timerSeq: 0, _voteSeq: 0, _chatAt: {},
           followers: new Map(), views: new Map(), recording: null, _recorded: [], passwordHash: null, announcements: [], _announceAt: 0,
-          snapshots: {} };
+          snapshots: {}, timer: null, votes: {}, reactions: {} };
     const saved = store.loadRoom(name);
     if(saved){
       if(Array.isArray(saved.strokes)) r.strokes = saved.strokes;
@@ -43,6 +43,10 @@ function getRoom(name){
       if(saved.passwordHash) r.passwordHash = saved.passwordHash;
       if(Array.isArray(saved.announcements)) r.announcements = saved.announcements;
       if(saved.snapshots && typeof saved.snapshots === 'object') r.snapshots = saved.snapshots;
+      if(saved.timer && typeof saved.timer === 'object') r.timer = saved.timer;
+      if(saved.votes && typeof saved.votes === 'object') r.votes = saved.votes;
+      if(saved.reactions && typeof saved.reactions === 'object') r.reactions = saved.reactions;
+      if(typeof saved._voteSeq === 'number') r._voteSeq = saved._voteSeq;
     }
     rooms.set(name, r);
     hist.ensureHistory(r);
@@ -140,6 +144,44 @@ function serializePoll(poll){
 }
 function serializeTimer(t){
   return { tid: t.tid, label: t.label, total: t.total, remaining: t.remaining, running: !!t.running, author: t.author };
+}
+// 协作投票(ci372)辅助：统计票数与序列化（不让 voters 明细外泄）
+function tallyVote(v){
+  const counts = new Array(v.options.length).fill(0);
+  for(const cid in v.voters){ const i = v.voters[cid]; if(Number.isInteger(i) && i >= 0 && i < v.options.length) counts[i]++; }
+  v.options.forEach((o, i) => { o.votes = counts[i]; });
+  v.total = Object.keys(v.voters).length;
+}
+function serializeVote(v){
+  return { vid: v.vid, question: v.question, options: v.options.map(o => ({ text: o.text, votes: o.votes })),
+           closed: !!v.closed, author: v.author, total: v.total };
+}
+// 快照构造：连接时与 request_snapshot 共用，确保迟到者/导出看到一致的全量房间元数据
+// （隐性修复：此前连接快照仅含 strokes/chats，缺 stars/layerNames/timer/votes/reactions 等，导致迟到者状态不一致）
+function buildSnapshot(room){
+  return {
+    strokes: room.strokes,
+    chats: room.chats,
+    polls: room.polls.map(serializePoll),
+    timers: room.timers.map(serializeTimer),
+    bg: room.bg,
+    title: room.title,
+    permissions: room.permissions || 'all',
+    grid: !!room.grid,
+    snap: !!room.snap,
+    locked: !!room.locked,
+    owner: room.owner,
+    stars: room.stars || {},
+    layerNames: room.layerNames || {},
+    muted_list: room.muted ? [...room.muted] : [],
+    lockedElements: room.lockedElements ? [...room.lockedElements] : [],
+    pinnedChat: room.pinnedChat || null,
+    spotlight: room.spotlight || null,
+    announcements: room.announcements || [],
+    timer: room.timer || null,
+    votes: room.votes || {},
+    reactions: room.reactions || {}
+  };
 }
 
 // ---- 极简 HTTP 管理 API（非 WS 的 GET 请求走这里）----
@@ -583,14 +625,26 @@ function handleData(sock, buf, room){
           case 'laser_end':
             broadcast(room, JSON.stringify({ type:'laser_end', author: sock._cid }), sock);
             break;
-          case 'typing':
-            broadcast(room, JSON.stringify({ type:'typing', id: sock._cid, name: sock.name || '匿名', on: obj.on !== false }), sock);
-            break;                                      // 不存储，仅转发
+          case 'typing':   // ci360 打字状态：广播谁在输入；限频防刷屏、幂等去重、不持久化
+            {
+              const now = Date.now();
+              if(sock._typingAt && now - sock._typingAt < 60){ sock._typingDrops = (sock._typingDrops || 0) + 1; break; }  // 限频：丢弃过密帧(防刷屏)
+              sock._typingAt = now;
+              const on = obj.on !== false;
+              if(sock._typingOn === on) break;            // 幂等：状态未变不重复广播
+              sock._typingOn = on;
+              room._typingCount = (room._typingCount || 0) + 1;   // 可观测性：累计打字事件数
+              broadcast(room, JSON.stringify({ type:'typing', id: sock._cid, name: sock.name || '匿名', on }), sock);
+            }
+            break;
           case 'raise_hand':   // 举手(会议场景)：不存储、实时转发给所有人(含发送者)，便于自身/他人都看到举手状态
             broadcast(room, JSON.stringify({ type:'hand', id: sock._cid, name: sock.name || '匿名', on: obj.on !== false }));
             break;
           case 'react':
             { // 即时表情回应(👍🎉…)：不落库、不受房间锁限制、不回显给发送者，仅实时转发给他人
+              const now = Date.now();
+              if(sock._reactAt && now - sock._reactAt < 80){ break; }  // 隐性修复：限频(80ms)防表情刷屏洪泛
+              sock._reactAt = now;
               const emoji = (typeof obj.emoji === 'string') ? String(obj.emoji).slice(0, 8) : '';
               if(!emoji) break;
               broadcast(room, JSON.stringify({ type:'react', id: sock._cid, name: sock.name || '匿名', color: sock.color || '#888', emoji }), sock);
@@ -763,7 +817,7 @@ function handleData(sock, buf, room){
             broadcast(room, JSON.stringify({ type:'timer_updated', timer: serializeTimer(t) }));
             store.saveRoom(room.name, room); break;
           }
-          case 'request_snapshot': sendFrame(sock, JSON.stringify({ type:'snapshot', strokes: room.strokes, chats: room.chats, polls: room.polls.map(serializePoll), timers: room.timers.map(serializeTimer), bg: room.bg, title: room.title, permissions: room.permissions || 'all', grid: !!room.grid, snap: !!room.snap, locked: !!room.locked, owner: room.owner, stars: room.stars || {}, layerNames: room.layerNames || {} })); break;  // 隐性问题：快照补齐房间元数据(含 ci348 stars / ci352 layerNames)，迟到者/导出一致
+          case 'request_snapshot': sendFrame(sock, JSON.stringify({ type:'snapshot', ...buildSnapshot(room) })); break;
           case 'room_list': sendFrame(sock, JSON.stringify({ type:'room_list', rooms: roomListPayload() })); break;
           case 'lock':
             if(sock._cid === room.owner){
@@ -1391,6 +1445,84 @@ function handleData(sock, buf, room){
               store.saveRoom(room.name, room);
             }
             break;
+          case 'emoji_reaction':   // ci364 全局表情：某人对画板发表情，轻量存 room.reactions，广播全员(含发送者)
+            {
+              if(typeof obj.emoji !== 'string' || !obj.emoji.trim()){ sendFrame(sock, JSON.stringify({ type:'error', code:'bad_emoji', msg:'emoji_reaction 需要非空 emoji' })); break; }
+              const emoji = obj.emoji.trim().slice(0, 8);
+              if(!room.reactions || typeof room.reactions !== 'object') room.reactions = {};
+              room.reactions[emoji] = (room.reactions[emoji] || 0) + 1;
+              broadcast(room, JSON.stringify({ type:'emoji_reaction', id: sock._cid, name: sock.name || '匿名', emoji, count: room.reactions[emoji] }));
+              store.saveRoom(room.name, room);   // 轻量持久化计数
+            }
+            break;
+          case 'timer_start':   // ci368 协作计时器-开始：room.timer = {total,remaining,running,startedAt}
+            {
+              const total = Math.max(1, Math.min(3600, Math.trunc(Number(obj.seconds) || 0)));
+              if(!Number.isFinite(obj.seconds) || total <= 0){ sendFrame(sock, JSON.stringify({ type:'error', code:'bad_seconds', msg:'timer_start 需要正整数 seconds(1-3600)' })); break; }
+              room.timer = { total, remaining: total, running: true, startedAt: Date.now(), by: sock._cid };
+              broadcast(room, JSON.stringify({ type:'timer', action:'start', total, remaining: total, running: true, by: sock._cid }));
+              store.saveRoom(room.name, room);
+            }
+            break;
+          case 'timer_pause':   // ci368 协作计时器-暂停
+            {
+              if(!room.timer){ sendFrame(sock, JSON.stringify({ type:'error', code:'no_timer', msg:'当前没有运行中的计时器' })); break; }
+              if(room.timer.running){ room.timer.running = false; broadcast(room, JSON.stringify({ type:'timer', action:'pause', remaining: room.timer.remaining, running: false, by: sock._cid })); store.saveRoom(room.name, room); }
+            }
+            break;
+          case 'timer_stop':   // ci368 协作计时器-停止(清零)
+            {
+              if(!room.timer){ sendFrame(sock, JSON.stringify({ type:'error', code:'no_timer', msg:'当前没有运行中的计时器' })); break; }
+              room.timer = null;
+              broadcast(room, JSON.stringify({ type:'timer', action:'stop', remaining: 0, running: false }));
+              store.saveRoom(room.name, room);
+            }
+            break;
+          case 'vote_create':   // ci372 投票-创建：room.votes[vid] = {question,options,voters,...}
+            {
+              if(typeof obj.question !== 'string' || !obj.question.trim()){ sendFrame(sock, JSON.stringify({ type:'error', code:'bad_question', msg:'vote_create 需要 question' })); break; }
+              if(!Array.isArray(obj.options) || obj.options.length < 2 || obj.options.length > 10){ sendFrame(sock, JSON.stringify({ type:'error', code:'bad_options', msg:'vote_create 需要 2-10 个选项' })); break; }
+              const opts = obj.options.map(o => ({ text: String(o).slice(0, 40), votes: 0 }));
+              room._voteSeq = (room._voteSeq || 0) + 1;
+              const vid = room._voteSeq;
+              room.votes[vid] = { vid, question: obj.question.trim().slice(0, 80), options: opts, voters: {}, author: sock._cid, closed: false, total: 0 };
+              broadcast(room, JSON.stringify({ type:'vote', action:'create', vote: serializeVote(room.votes[vid]) }));
+              store.saveRoom(room.name, room);
+            }
+            break;
+          case 'vote_cast':   // ci372 投票-投票(每人一题一票，可改票/取消)
+            {
+              const vid = obj.vid;
+              const v = (vid != null) ? room.votes[vid] : null;
+              if(!v){ sendFrame(sock, JSON.stringify({ type:'error', code:'no_such_vote', msg:'找不到该投票' })); break; }
+              if(v.closed){ sendFrame(sock, JSON.stringify({ type:'error', code:'vote_closed', msg:'投票已结束' })); break; }
+              if(!Number.isInteger(obj.option) || obj.option < 0 || obj.option >= v.options.length){ sendFrame(sock, JSON.stringify({ type:'error', code:'bad_option', msg:'无效选项索引' })); break; }
+              const cid = sock._cid;
+              if(v.voters[cid] === obj.option) delete v.voters[cid];   // 再次点同一选项=取消票(幂等)
+              else v.voters[cid] = obj.option;
+              tallyVote(v);
+              broadcast(room, JSON.stringify({ type:'vote', action:'cast', vid, vote: serializeVote(v) }));
+              store.saveRoom(room.name, room);
+            }
+            break;
+          case 'vote_result':   // ci372 投票-结果(广播当前 tally)
+            {
+              const vid = obj.vid;
+              const v = (vid != null) ? room.votes[vid] : null;
+              if(!v){ sendFrame(sock, JSON.stringify({ type:'error', code:'no_such_vote', msg:'找不到该投票' })); break; }
+              broadcast(room, JSON.stringify({ type:'vote', action:'result', vid, vote: serializeVote(v) }));
+            }
+            break;
+          case 'cursor_presence':   // ci376 高精度光标：节流广播(默认 33ms，可调 minInterval)，带 x/y/ts
+            {
+              if(typeof obj.x !== 'number' || typeof obj.y !== 'number' || !Number.isFinite(obj.x) || !Number.isFinite(obj.y)){ sendFrame(sock, JSON.stringify({ type:'error', code:'bad_coord', msg:'cursor_presence 需要数值 x/y' })); break; }
+              const min = (typeof obj.minInterval === 'number' && obj.minInterval >= 0) ? Math.min(1000, obj.minInterval) : 33;
+              const now = Date.now();
+              if(sock._curAt && now - sock._curAt < min){ sock._curDrops = (sock._curDrops || 0) + 1; break; }   // 节流防刷屏
+              sock._curAt = now;
+              broadcast(room, JSON.stringify({ type:'cursor_presence', id: sock._cid, x: obj.x, y: obj.y, ts: now, name: sock.name || '匿名' }), sock);
+            }
+            break;
           case 'board_search':   // ci356 整板文本搜索：在 text/note/pin/stamp/comment 的文字里不区分大小写查找，仅回给请求者(最多 50 条)，只读
             {
               const q = typeof obj.q === 'string' ? obj.q.trim() : '';
@@ -1469,7 +1601,7 @@ const server = net.createServer(sock=>{
       sock.roomName = roomName;
       buffer = buffer.slice(idx + 4);
       sendFrame(sock, JSON.stringify({ type:'welcome', id: sock._cid, color: sock.color, room: roomName }));
-      sendFrame(sock, JSON.stringify({ type:'snapshot', strokes: room.strokes, chats: room.chats, room: roomName }));
+      sendFrame(sock, JSON.stringify({ type:'snapshot', ...buildSnapshot(room), room: roomName }));
       if(room.bg) sendFrame(sock, JSON.stringify({ type:'bg', color: room.bg, by: room.owner }));  // 迟到者也能拿到当前背景
       if(room.title) sendFrame(sock, JSON.stringify({ type:'title', title: room.title, by: room.owner }));  // 迟到者也能拿到当前标题
       if(room.lockedElements.size) sendFrame(sock, JSON.stringify({ type:'lock_element', ids: [...room.lockedElements], locked:true, by: room.owner }));  // 迟到者也能拿到已锁定元素集合
@@ -1525,6 +1657,12 @@ setInterval(heartbeat, HB);
 function tickTimers(){
   for(const room of rooms.values()){
     let changed = false;
+    if(room.timer && room.timer.running && room.timer.remaining > 0){   // ci368 单计时器倒计时
+      room.timer.remaining--;
+      broadcast(room, JSON.stringify({ type:'timer', action:'tick', remaining: room.timer.remaining, running: true }));
+      changed = true;
+      if(room.timer.remaining <= 0){ room.timer.running = false; broadcast(room, JSON.stringify({ type:'timer', action:'finished', remaining: 0, running: false })); }
+    }
     for(const t of room.timers){
       if(t.running && t.remaining > 0){
         t.remaining--;

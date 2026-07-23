@@ -32,6 +32,10 @@ function saveRoom(name, data){
     passwordHash: (typeof data.passwordHash === 'string') ? data.passwordHash : null,
     announcements: Array.isArray(data.announcements) ? data.announcements : [],
     snapshots: (data.snapshots && typeof data.snapshots === 'object') ? data.snapshots : {},
+    timer: (data.timer && typeof data.timer === 'object') ? data.timer : null,
+    votes: (data.votes && typeof data.votes === 'object') ? data.votes : {},
+    reactions: (data.reactions && typeof data.reactions === 'object') ? data.reactions : {},
+    _voteSeq: (typeof data._voteSeq === 'number') ? data._voteSeq : 0,
     _chatSeq: (typeof data._chatSeq === 'number') ? data._chatSeq : 0
   };
   fs.writeFileSync(f, JSON.stringify(payload));
@@ -59,6 +63,10 @@ function loadRoom(name){
       passwordHash: (typeof o.passwordHash === 'string') ? o.passwordHash : null,
       announcements: Array.isArray(o.announcements) ? o.announcements : [],
       snapshots: (o.snapshots && typeof o.snapshots === 'object') ? o.snapshots : {},
+      timer: (o.timer && typeof o.timer === 'object') ? o.timer : null,
+      votes: (o.votes && typeof o.votes === 'object') ? o.votes : {},
+      reactions: (o.reactions && typeof o.reactions === 'object') ? o.reactions : {},
+      _voteSeq: (typeof o._voteSeq === 'number') ? o._voteSeq : 0,
       _chatSeq: (typeof o._chatSeq === 'number') ? o._chatSeq : 0
     };
   } catch(e){ return null; }
