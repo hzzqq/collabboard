@@ -457,6 +457,11 @@ function handleData(sock, buf, room){
               const before = room.strokes.length;
               const arr = room.strokes.filter(el => !(el && set.has(el.id)));
               if(arr.length === before) break;                 // 无命中任何 id 则忽略
+              // ci336 隐性修复：若被删除元素正是当前演示聚焦元素，自动解除聚焦并广播，避免聚焦悬空
+              if(room.elementFocus && set.has(room.elementFocus.elId)){
+                const fe = room.elementFocus.elId; room.elementFocus = null;
+                broadcast(room, JSON.stringify({ type:'focus_element_off', elId: fe, by: room.owner, reason:'deleted' }));
+              }
               hist.commitStrokes(room, arr);                   // 传新数组，旧状态进撤销栈
               broadcast(room, JSON.stringify({ type:'replace', strokes: room.strokes }), sock);
               store.saveRoom(room.name, room);
@@ -671,6 +676,10 @@ function handleData(sock, buf, room){
             room.chats = room.chats.filter(c => c.mid !== obj.mid);
             if(room.chats.length !== before){
               broadcast(room, JSON.stringify({ type:'chat_deleted', mid: obj.mid, by: sock._cid }));
+              if(room.pinnedChat && room.pinnedChat.mid === obj.mid){   // ci328 隐性问题：置顶消息被删除时同步取消置顶，避免悬挂引用
+                room.pinnedChat = null;
+                broadcast(room, JSON.stringify({ type:'chat_unpinned', mid: obj.mid, by: sock._cid, reason: 'deleted' }));
+              }
               store.saveRoom(room.name, room);
             } else {
               sendFrame(sock, JSON.stringify({ type:'error', code:'no_such_chat', msg:'找不到该聊天消息' }));
@@ -1272,6 +1281,65 @@ function handleData(sock, buf, room){
               }
             }
             break;
+          case 'pin_message':   // ci328 房主置顶聊天消息：按 mid 定位，存 room.pinnedChat 并持久化，广播全员
+            {
+              if(sock._cid !== room.owner){ sendFrame(sock, JSON.stringify({ type:'error', code:'not_owner', msg:'只有房主能置顶消息' })); break; }
+              if(typeof obj.mid !== 'number'){ sendFrame(sock, JSON.stringify({ type:'error', code:'bad_mid', msg:'pin_message 需要数值 mid' })); break; }
+              const target = room.chats.find(c => c.mid === obj.mid);
+              if(!target){ sendFrame(sock, JSON.stringify({ type:'error', code:'no_such_message', msg:'消息不存在或已删除' })); break; }
+              room.pinnedChat = { mid: target.mid, text: target.text, name: target.name, id: target.id, t: target.t, pinnedBy: sock._cid, pinnedAt: Date.now() };
+              broadcast(room, JSON.stringify({ type:'chat_pinned', pinned: room.pinnedChat }));
+              store.saveRoom(room.name, room);
+            }
+            break;
+          case 'unpin_message':   // ci328 房主取消置顶：清空 pinnedChat，广播全员（无置顶时报错，幂等提示）
+            {
+              if(sock._cid !== room.owner){ sendFrame(sock, JSON.stringify({ type:'error', code:'not_owner', msg:'只有房主能取消置顶' })); break; }
+              if(!room.pinnedChat){ sendFrame(sock, JSON.stringify({ type:'error', code:'no_pinned', msg:'当前没有置顶消息' })); break; }
+              const prev = room.pinnedChat.mid;
+              room.pinnedChat = null;
+              broadcast(room, JSON.stringify({ type:'chat_unpinned', mid: prev, by: sock._cid }));
+              store.saveRoom(room.name, room);
+            }
+            break;
+          case 'spotlight':   // ci332 房主聚光灯：将某成员设为全员焦点（演示模式），广播 spotlight_on
+            {
+              if(sock._cid !== room.owner){ sendFrame(sock, JSON.stringify({ type:'error', code:'not_owner', msg:'只有房主能开启聚光灯' })); break; }
+              if(typeof obj.cid !== 'string' || obj.cid.length === 0){ sendFrame(sock, JSON.stringify({ type:'error', code:'bad_cid', msg:'spotlight 需要有效的 cid' })); break; }
+              const target = [...room.clients].find(c => c._cid === obj.cid);
+              if(!target){ sendFrame(sock, JSON.stringify({ type:'error', code:'no_such_member', msg:'该成员不在房间内' })); break; }
+              room.spotlight = { cid: target._cid, name: target.name || ('用户' + target._cid), by: sock._cid, at: Date.now() };
+              broadcast(room, JSON.stringify({ type:'spotlight_on', spotlight: room.spotlight }));
+            }
+            break;
+          case 'spotlight_off':   // ci332 房主关闭聚光灯：清空 room.spotlight，广播 spotlight_off（无聚光灯时报错）
+            {
+              if(sock._cid !== room.owner){ sendFrame(sock, JSON.stringify({ type:'error', code:'not_owner', msg:'只有房主能关闭聚光灯' })); break; }
+              if(!room.spotlight){ sendFrame(sock, JSON.stringify({ type:'error', code:'no_spotlight', msg:'当前没有聚光灯' })); break; }
+              const prev = room.spotlight.cid;
+              room.spotlight = null;
+              broadcast(room, JSON.stringify({ type:'spotlight_off', cid: prev, by: sock._cid }));
+            }
+            break;
+          case 'focus_element':   // ci336 房主演示聚焦某元素：将某元素设为全员视图中心(演示模式)，广播 focus_element_on
+            {
+              if(sock._cid !== room.owner){ sendFrame(sock, JSON.stringify({ type:'error', code:'not_owner', msg:'只有房主能聚焦元素' })); break; }
+              if(typeof obj.elId !== 'string' || obj.elId.length === 0){ sendFrame(sock, JSON.stringify({ type:'error', code:'bad_elId', msg:'focus_element 需要有效的 elId' })); break; }
+              const el = room.strokes.find(s => s && s.id === obj.elId);
+              if(!el){ sendFrame(sock, JSON.stringify({ type:'error', code:'no_such_element', msg:'该元素不存在' })); break; }
+              room.elementFocus = { elId: el.id, by: sock._cid, at: Date.now() };
+              broadcast(room, JSON.stringify({ type:'focus_element_on', elId: el.id, by: sock._cid }));
+            }
+            break;
+          case 'focus_element_off':   // ci336 房主关闭元素聚焦：清空 room.elementFocus，广播 focus_element_off（无聚焦时报错）
+            {
+              if(sock._cid !== room.owner){ sendFrame(sock, JSON.stringify({ type:'error', code:'not_owner', msg:'只有房主能关闭元素聚焦' })); break; }
+              if(!room.elementFocus){ sendFrame(sock, JSON.stringify({ type:'error', code:'no_focus', msg:'当前没有元素聚焦' })); break; }
+              const prev = room.elementFocus.elId;
+              room.elementFocus = null;
+              broadcast(room, JSON.stringify({ type:'focus_element_off', elId: prev, by: sock._cid }));
+            }
+            break;
         }
       }catch(e){ /* ignore */ }
     }
@@ -1347,6 +1415,10 @@ const server = net.createServer(sock=>{
       for(const set of room.followers.values()) set.delete(s._cid);
     }
     if(room.views) room.views.delete(s._cid);
+    if(room.spotlight && room.spotlight.cid === s._cid){   // ci332 隐性问题：被聚焦成员离场时自动关闭聚光灯，避免全员盯着空位
+      room.spotlight = null;
+      broadcast(room, JSON.stringify({ type:'spotlight_off', cid: s._cid, reason:'left' }));
+    }
     // 房主离开则提拔下一位客户端为房主并解锁，避免房间被永久锁死
     if(room.owner === s._cid && room.clients.size > 0){
       room.owner = room.clients.values().next().value._cid;
