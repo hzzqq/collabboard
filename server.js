@@ -24,7 +24,7 @@ function getRoom(name){
   if(!r){
     r = { clients: new Set(), strokes: [], chats: [], polls: [], timers: [], name, owner: null, locked: false, lockedElements: new Set(), muted: new Set(), banned: new Set(), bg: null, title: null, _chatSeq: 0, slowMode: 0, _pollSeq: 0, _timerSeq: 0, _voteSeq: 0, _chatAt: {},
           followers: new Map(), views: new Map(), recording: null, _recorded: [], passwordHash: null, announcements: [], _announceAt: 0,
-          snapshots: {}, timer: null, votes: {}, reactions: {} };
+          snapshots: {}, timer: null, votes: {}, reactions: {}, locks: {}, roles: {}, versions: [] };
     const saved = store.loadRoom(name);
     if(saved){
       if(Array.isArray(saved.strokes)) r.strokes = saved.strokes;
@@ -46,6 +46,9 @@ function getRoom(name){
       if(saved.timer && typeof saved.timer === 'object') r.timer = saved.timer;
       if(saved.votes && typeof saved.votes === 'object') r.votes = saved.votes;
       if(saved.reactions && typeof saved.reactions === 'object') r.reactions = saved.reactions;
+      if(saved.locks && typeof saved.locks === 'object') r.locks = saved.locks;
+      if(saved.roles && typeof saved.roles === 'object') r.roles = saved.roles;
+      if(Array.isArray(saved.versions)) r.versions = saved.versions;
       if(typeof saved._voteSeq === 'number') r._voteSeq = saved._voteSeq;
     }
     rooms.set(name, r);
@@ -180,7 +183,10 @@ function buildSnapshot(room){
     announcements: room.announcements || [],
     timer: room.timer || null,
     votes: room.votes || {},
-    reactions: room.reactions || {}
+    reactions: room.reactions || {},
+    locks: room.locks || {},
+    roles: room.roles || {},
+    versions: (room.versions || []).map(v => ({ id: v.id, name: v.name, by: v.by, ts: v.ts }))
   };
 }
 
@@ -359,15 +365,46 @@ function handleData(sock, buf, room){
             break;
           }
           case 'comment':
-            if(typeof obj.id !== 'string' || !obj.id) break;
-            if(typeof obj.text !== 'string' || !obj.text.trim()) break;
+            // 隐性修复(ci388)：原先非法参数直接 break 静默丢弃，调用方无感知；现回 error 便于排查
+            if(typeof obj.id !== 'string' || !obj.id){ sendFrame(sock, JSON.stringify({ type:'error', code:'bad_id', msg:'comment 需要元素 id' })); break; }
+            if(typeof obj.text !== 'string' || !obj.text.trim()){ sendFrame(sock, JSON.stringify({ type:'error', code:'bad_text', msg:'comment 需要文本' })); break; }
             {
               const el = room.strokes.find(s => s && s.id === obj.id);
               if(!el){ sendFrame(sock, JSON.stringify({ type:'error', code:'no_such_element', msg:'评论的元素不存在' })); break; }
               const comment = { author: sock._cid, authorColor: sock.color, text: obj.text.slice(0,200).trim(), ts: Date.now() };
               if(!Array.isArray(el.comments)) el.comments = [];
+              if(el.comments.length >= 200){ sendFrame(sock, JSON.stringify({ type:'error', code:'too_many_comments', msg:'评论数已达上限(200)' })); break; }
               el.comments.push(comment);                         // el 是 room.strokes 中元素的引用，原地追加即可持久化
               broadcast(room, JSON.stringify({ type:'comment', id: obj.id, comment }), sock);
+              store.saveRoom(room.name, room);
+            }
+            break;
+          case 'comment_add':   // 显式评论线程 API：与 comment 语义一致，便于新客户端按线程增删
+            {
+              const cid = (typeof obj.id === 'string') ? obj.id : '';
+              const text = (typeof obj.text === 'string') ? obj.text : '';
+              if(!cid){ sendFrame(sock, JSON.stringify({ type:'error', code:'bad_id', msg:'comment_add 需要元素 id' })); break; }
+              if(!text.trim()){ sendFrame(sock, JSON.stringify({ type:'error', code:'bad_text', msg:'comment_add 需要文本' })); break; }
+              const el = room.strokes.find(s => s && s.id === cid);
+              if(!el){ sendFrame(sock, JSON.stringify({ type:'error', code:'no_such_element', msg:'评论的元素不存在' })); break; }
+              if(!Array.isArray(el.comments)) el.comments = [];
+              if(el.comments.length >= 200){ sendFrame(sock, JSON.stringify({ type:'error', code:'too_many_comments', msg:'评论数已达上限(200)' })); break; }
+              const comment = { author: sock._cid, authorColor: sock.color, text: text.slice(0,200).trim(), ts: Date.now() };
+              el.comments.push(comment);
+              broadcast(room, JSON.stringify({ type:'comment', id: cid, comment, action:'add' }), sock);
+              store.saveRoom(room.name, room);
+            }
+            break;
+          case 'comment_del':   // 删除元素上某条评论（按 index），广播 comment(action=del) 便于他人同步
+            {
+              const cid = (typeof obj.id === 'string') ? obj.id : '';
+              const idx = (typeof obj.index === 'number') ? obj.index : -1;
+              if(!cid){ sendFrame(sock, JSON.stringify({ type:'error', code:'bad_id', msg:'comment_del 需要元素 id' })); break; }
+              const el = room.strokes.find(s => s && s.id === cid);
+              if(!el || !Array.isArray(el.comments) || el.comments.length === 0){ sendFrame(sock, JSON.stringify({ type:'error', code:'no_comment', msg:'该元素没有评论' })); break; }
+              if(idx < 0 || idx >= el.comments.length){ sendFrame(sock, JSON.stringify({ type:'error', code:'bad_index', msg:'评论索引越界' })); break; }
+              const removed = el.comments.splice(idx, 1)[0];
+              broadcast(room, JSON.stringify({ type:'comment', id: cid, action:'del', index: idx, removed }), sock);
               store.saveRoom(room.name, room);
             }
             break;
@@ -851,18 +888,25 @@ function handleData(sock, buf, room){
             break;
           case 'lock_element':
             if(sock._cid !== room.owner){ sendFrame(sock, JSON.stringify({ type:'error', code:'not_owner', msg:'只有房主能锁定元素' })); break; }
-            { const lids = (Array.isArray(obj.ids) && obj.ids.length) ? obj.ids : (obj.id != null ? [obj.id] : null);
-              if(!lids){ sendFrame(sock, JSON.stringify({ type:'error', code:'bad_id', msg:'缺少元素 id' })); break; }
-              for(const id of lids) room.lockedElements.add(id);
-              broadcast(room, JSON.stringify({ type:'lock_element', ids: lids, locked:true, by: room.owner }));
+            { const lids = (Array.isArray(obj.ids) && obj.ids.length) ? obj.ids : (typeof obj.id === 'string' && obj.id ? [obj.id] : null);
+              // 隐性修复(ci380)：原先不校验 id 类型与元素存在，可锁定虚元素；现要求字符串且元素存在
+              if(!lids || !lids.every(id => typeof id === 'string' && id)){ sendFrame(sock, JSON.stringify({ type:'error', code:'bad_id', msg:'lock_element 需要字符串元素 id' })); break; }
+              const missing = lids.filter(id => !room.strokes.some(s => s && s.id === id));
+              if(missing.length){ sendFrame(sock, JSON.stringify({ type:'error', code:'no_such_element', msg:'锁定了不存在的元素: ' + missing.join(',') })); break; }
+              if(!room.locks) room.locks = {};
+              for(const id of lids){ room.lockedElements.add(id); room.locks[id] = { by: sock._cid, locked:true, ts: Date.now() }; }
+              broadcast(room, JSON.stringify({ type:'lock_element', ids: lids, locked:true, by: sock._cid }));   // 兼容旧客户端
+              for(const id of lids) broadcast(room, JSON.stringify({ type:'element_locked', elId: id, by: sock._cid, locked:true }));  // 规范帧
               store.saveRoom(room.name, room); }
             break;
           case 'unlock_element':
             if(sock._cid !== room.owner){ sendFrame(sock, JSON.stringify({ type:'error', code:'not_owner', msg:'只有房主能解锁元素' })); break; }
-            { const lids = (Array.isArray(obj.ids) && obj.ids.length) ? obj.ids : (obj.id != null ? [obj.id] : null);
-              if(!lids){ sendFrame(sock, JSON.stringify({ type:'error', code:'bad_id', msg:'缺少元素 id' })); break; }
-              for(const id of lids) room.lockedElements.delete(id);
-              broadcast(room, JSON.stringify({ type:'lock_element', ids: lids, locked:false, by: room.owner }));
+            { const lids = (Array.isArray(obj.ids) && obj.ids.length) ? obj.ids : (typeof obj.id === 'string' && obj.id ? [obj.id] : null);
+              if(!lids || !lids.every(id => typeof id === 'string' && id)){ sendFrame(sock, JSON.stringify({ type:'error', code:'bad_id', msg:'unlock_element 需要字符串元素 id' })); break; }
+              if(!room.locks) room.locks = {};
+              for(const id of lids){ room.lockedElements.delete(id); delete room.locks[id]; }
+              broadcast(room, JSON.stringify({ type:'lock_element', ids: lids, locked:false, by: sock._cid }));   // 兼容旧客户端
+              for(const id of lids) broadcast(room, JSON.stringify({ type:'element_unlocked', elId: id, by: sock._cid, locked:false }));  // 规范帧
               store.saveRoom(room.name, room); }
             break;
           case 'transfer':
@@ -882,6 +926,26 @@ function handleData(sock, buf, room){
             }
             room.owner = obj.toId;
             broadcast(room, JSON.stringify({ type:'owner', owner: room.owner, locked: !!room.locked }));
+            store.saveRoom(room.name, room);   // 隐性修复(ci392)：转移房主后此前未持久化，重启会回退
+            break;
+          case 'set_role':   // 房主设置成员角色(owner/editor/viewer)，广播 member_role 并持久化
+            if(sock._cid !== room.owner){ sendFrame(sock, JSON.stringify({ type:'error', code:'not_owner', msg:'只有房主能设置角色' })); break; }
+            {
+              const tcid = (typeof obj.cid === 'string') ? obj.cid : '';
+              const role = (typeof obj.role === 'string') ? obj.role : '';
+              if(!tcid){ sendFrame(sock, JSON.stringify({ type:'error', code:'bad_cid', msg:'set_role 需要 cid' })); break; }
+              if(!['owner','editor','viewer'].includes(role)){ sendFrame(sock, JSON.stringify({ type:'error', code:'bad_role', msg:'角色必须是 owner/editor/viewer' })); break; }
+              room.roles = room.roles || {};
+              if(role === 'owner' && tcid !== room.owner){
+                room.roles[room.owner] = 'editor';
+                room.owner = tcid;
+                broadcast(room, JSON.stringify({ type:'owner', owner: room.owner, locked: !!room.locked }));
+              }
+              room.roles[tcid] = role;
+              // 同步元素锁由该成员持有的归属标记（仅记录，不强制）
+              broadcast(room, JSON.stringify({ type:'member_role', cid: tcid, role, by: sock._cid }));
+              store.saveRoom(room.name, room);
+            }
             break;
           case 'kick':    // 房主踢人：关闭目标连接并广播通知（被踢者不回显）
             if(sock._cid !== room.owner){
@@ -1191,6 +1255,7 @@ function handleData(sock, buf, room){
                 if(!room.followers.has(target)) room.followers.set(target, new Set());
                 room.followers.get(target).add(sock._cid);
                 broadcast(room, JSON.stringify({ type:'follow', from: sock._cid, name: sock.name || '匿名', toId: target }), sock);
+                broadcast(room, JSON.stringify({ type:'follow_start', by: sock._cid, target }), sock);   // 规范帧，便于 UI 提示
               } else {
                 broadcast(room, JSON.stringify({ type:'follow_stop', from: sock._cid }), sock);
               }
@@ -1245,6 +1310,47 @@ function handleData(sock, buf, room){
                 locked: !!room.locked, password: !!room.passwordHash
               };
               sendFrame(sock, JSON.stringify(stats));
+            }
+            break;
+          case 'save_version':   // 命名保存当前画板快照为版本（房主），维护 room.versions 并持久化
+            if(sock._cid !== room.owner){ sendFrame(sock, JSON.stringify({ type:'error', code:'not_owner', msg:'只有房主能保存版本' })); break; }
+            {
+              const vname = (typeof obj.name === 'string') ? obj.name.slice(0,60).trim() : '';
+              if(!vname){ sendFrame(sock, JSON.stringify({ type:'error', code:'bad_name', msg:'save_version 需要版本名' })); break; }
+              room.versions = room.versions || [];
+              const id = 'v' + Date.now().toString(36) + Math.random().toString(36).slice(2,6);
+              // R2 隐性修复(ci396)：原先 strokes 按引用存储，元素原地变更(如 comment_add 的 el.comments.push)会污染已存版本；现深拷贝隔离
+              const version = { id, name: vname, by: sock._cid, ts: Date.now(),
+                strokes: JSON.parse(JSON.stringify(room.strokes)), chats: JSON.parse(JSON.stringify(room.chats.slice(-200))), title: room.title, bg: room.bg };
+              room.versions.push(version);
+              if(room.versions.length > 50) room.versions = room.versions.slice(-50);   // 限长防内存/磁盘膨胀
+              broadcast(room, JSON.stringify({ type:'version_saved', id, name: vname, by: sock._cid, ts: version.ts, count: room.versions.length }));
+              store.saveRoom(room.name, room);
+            }
+            break;
+          case 'load_version':   // 恢复某版本画板（房主），广播 replace 让全员同步
+            if(sock._cid !== room.owner){ sendFrame(sock, JSON.stringify({ type:'error', code:'not_owner', msg:'只有房主能恢复版本' })); break; }
+            {
+              room.versions = room.versions || [];
+              const id = (typeof obj.id === 'string') ? obj.id : '';
+              const v = room.versions.find(x => x.id === id);
+              if(!v){ sendFrame(sock, JSON.stringify({ type:'error', code:'no_version', msg:'版本不存在' })); break; }
+              // R2 隐性修复(ci396)：恢复时深拷贝，避免后续原地编辑继续污染 stored 版本对象
+              room.strokes = Array.isArray(v.strokes) ? JSON.parse(JSON.stringify(v.strokes)) : room.strokes;
+              room.chats = Array.isArray(v.chats) ? JSON.parse(JSON.stringify(v.chats)) : room.chats;
+              if(typeof v.title === 'string') room.title = v.title;
+              if(typeof v.bg === 'string') room.bg = v.bg;
+              broadcast(room, JSON.stringify({ type:'replace', strokes: room.strokes }), sock);
+              if(room.title) broadcast(room, JSON.stringify({ type:'title', title: room.title, by: room.owner }));
+              if(room.bg) broadcast(room, JSON.stringify({ type:'bg', color: room.bg, by: room.owner }));
+              broadcast(room, JSON.stringify({ type:'version_loaded', id, name: v.name, by: sock._cid }));
+              store.saveRoom(room.name, room);
+            }
+            break;
+          case 'list_versions':   // 列出当前画板所有已保存版本（仅回请求者，含轻量元信息）
+            {
+              room.versions = room.versions || [];
+              sendFrame(sock, JSON.stringify({ type:'versions', versions: room.versions.map(v => ({ id:v.id, name:v.name, by:v.by, ts:v.ts })), by: sock._cid }));
             }
             break;
           case 'apply_template':   // 应用内置模板（白板/四象限），仅允许名单内模板，避免任意元素注入；可撤销
@@ -1617,6 +1723,11 @@ const server = net.createServer(sock=>{
     const room = s.room; if(!room) return;
     room.clients.delete(s);
     if(room.followers){                       // 隐性问题：清理离开者的 follow 关系，避免悬空引用
+      // ci384 隐性修复：被关注者离场时，主动通知其关注者停止跟随，否则关注者会一直跟随幽灵
+      if(room.followers.has(s._cid)){
+        const fset = room.followers.get(s._cid);
+        for(const fid of fset){ for(const c of room.clients){ if(c._cid === fid && !c.destroyed) sendFrame(c, JSON.stringify({ type:'follow_stop', by: s._cid, target: s._cid })); } }
+      }
       room.followers.delete(s._cid);
       for(const set of room.followers.values()) set.delete(s._cid);
     }

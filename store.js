@@ -35,6 +35,9 @@ function saveRoom(name, data){
     timer: (data.timer && typeof data.timer === 'object') ? data.timer : null,
     votes: (data.votes && typeof data.votes === 'object') ? data.votes : {},
     reactions: (data.reactions && typeof data.reactions === 'object') ? data.reactions : {},
+    locks: (data.locks && typeof data.locks === 'object') ? data.locks : {},
+    roles: (data.roles && typeof data.roles === 'object') ? data.roles : {},
+    versions: Array.isArray(data.versions) ? data.versions : [],
     _voteSeq: (typeof data._voteSeq === 'number') ? data._voteSeq : 0,
     _chatSeq: (typeof data._chatSeq === 'number') ? data._chatSeq : 0
   };
@@ -66,6 +69,9 @@ function loadRoom(name){
       timer: (o.timer && typeof o.timer === 'object') ? o.timer : null,
       votes: (o.votes && typeof o.votes === 'object') ? o.votes : {},
       reactions: (o.reactions && typeof o.reactions === 'object') ? o.reactions : {},
+      locks: (o.locks && typeof o.locks === 'object') ? o.locks : {},
+      roles: (o.roles && typeof o.roles === 'object') ? o.roles : {},
+      versions: Array.isArray(o.versions) ? o.versions : [],
       _voteSeq: (typeof o._voteSeq === 'number') ? o._voteSeq : 0,
       _chatSeq: (typeof o._chatSeq === 'number') ? o._chatSeq : 0
     };
