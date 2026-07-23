@@ -763,7 +763,7 @@ function handleData(sock, buf, room){
             broadcast(room, JSON.stringify({ type:'timer_updated', timer: serializeTimer(t) }));
             store.saveRoom(room.name, room); break;
           }
-          case 'request_snapshot': sendFrame(sock, JSON.stringify({ type:'snapshot', strokes: room.strokes, chats: room.chats, polls: room.polls.map(serializePoll), timers: room.timers.map(serializeTimer), bg: room.bg, title: room.title, permissions: room.permissions || 'all', grid: !!room.grid, snap: !!room.snap, locked: !!room.locked, owner: room.owner })); break;  // 隐性问题：快照补齐房间元数据，迟到者/导出一致
+          case 'request_snapshot': sendFrame(sock, JSON.stringify({ type:'snapshot', strokes: room.strokes, chats: room.chats, polls: room.polls.map(serializePoll), timers: room.timers.map(serializeTimer), bg: room.bg, title: room.title, permissions: room.permissions || 'all', grid: !!room.grid, snap: !!room.snap, locked: !!room.locked, owner: room.owner, stars: room.stars || {}, layerNames: room.layerNames || {} })); break;  // 隐性问题：快照补齐房间元数据(含 ci348 stars / ci352 layerNames)，迟到者/导出一致
           case 'room_list': sendFrame(sock, JSON.stringify({ type:'room_list', rooms: roomListPayload() })); break;
           case 'lock':
             if(sock._cid === room.owner){
@@ -1338,6 +1338,80 @@ function handleData(sock, buf, room){
               const prev = room.elementFocus.elId;
               room.elementFocus = null;
               broadcast(room, JSON.stringify({ type:'focus_element_off', elId: prev, by: sock._cid }));
+            }
+            break;
+          case 'poke':   // ci340 戳一戳：任意成员定向提醒另一成员(仅目标收到 poked, 发送者收 poke_sent 回执)；限频 3s
+            {
+              if(typeof obj.cid !== 'string' || obj.cid.length === 0){ sendFrame(sock, JSON.stringify({ type:'error', code:'bad_cid', msg:'poke 需要有效的 cid' })); break; }
+              if(obj.cid === sock._cid){ sendFrame(sock, JSON.stringify({ type:'error', code:'self_poke', msg:'不能戳自己' })); break; }
+              const now = Date.now();
+              if(sock._lastPokeAt && now - sock._lastPokeAt < 3000){ sendFrame(sock, JSON.stringify({ type:'error', code:'poke_too_fast', msg:'戳一戳太频繁，请稍后再试' })); break; }
+              const target = [...room.clients].find(c => c._cid === obj.cid);
+              if(!target){ sendFrame(sock, JSON.stringify({ type:'error', code:'no_such_member', msg:'该成员不在房间内' })); break; }
+              sock._lastPokeAt = now;
+              sendFrame(target, JSON.stringify({ type:'poked', from: sock._cid, name: sock.name || ('用户' + sock._cid), at: now }));
+              sendFrame(sock, JSON.stringify({ type:'poke_sent', cid: target._cid, at: now }));
+            }
+            break;
+          case 'list_members':   // ci344 成员名册：仅回给请求者（cid/name/avatar/status/isOwner），只读、不广播、不落库
+            {
+              const members = [...room.clients].map(c => ({
+                cid: c._cid,
+                name: c.name || ('用户' + (c._cid || '?')),
+                avatar: c.avatar || null,
+                status: c.status || 'online',
+                isOwner: c._cid === room.owner
+              }));
+              sendFrame(sock, JSON.stringify({ type:'member_list', members, count: members.length, owner: room.owner || null }));
+            }
+            break;
+          case 'star_element':   // ci348 元素收藏(toggle)：任意成员对存在的元素加/取消星标，room.stars = {elId:[cid,...]}，广播含最新计数并持久化
+            {
+              if(typeof obj.elId !== 'string' || obj.elId.length === 0){ sendFrame(sock, JSON.stringify({ type:'error', code:'bad_elId', msg:'star_element 需要有效的 elId' })); break; }
+              const el = room.strokes.find(s => s && s.id === obj.elId);
+              if(!el){ sendFrame(sock, JSON.stringify({ type:'error', code:'no_such_element', msg:'该元素不存在' })); break; }
+              if(!room.stars || typeof room.stars !== 'object') room.stars = {};
+              const arr = Array.isArray(room.stars[el.id]) ? room.stars[el.id] : [];
+              const i = arr.indexOf(sock._cid);
+              let starred;
+              if(i === -1){ arr.push(sock._cid); starred = true; } else { arr.splice(i, 1); starred = false; }
+              if(arr.length) room.stars[el.id] = arr; else delete room.stars[el.id];
+              broadcast(room, JSON.stringify({ type: starred ? 'element_starred' : 'element_unstarred', elId: el.id, by: sock._cid, count: arr.length }));
+              store.saveRoom(room.name, room);
+            }
+            break;
+          case 'set_layer_name':   // ci352 房主命名图层：room.layerNames = {layerId: name}，name 空则删除命名；广播 layer_name 并持久化
+            {
+              if(sock._cid !== room.owner){ sendFrame(sock, JSON.stringify({ type:'error', code:'not_owner', msg:'只有房主能命名图层' })); break; }
+              if(typeof obj.layerId !== 'string' || obj.layerId.length === 0){ sendFrame(sock, JSON.stringify({ type:'error', code:'bad_layerId', msg:'set_layer_name 需要有效的 layerId' })); break; }
+              const nm = typeof obj.name === 'string' ? obj.name.trim().slice(0, 32) : '';
+              if(!room.layerNames || typeof room.layerNames !== 'object') room.layerNames = {};
+              if(nm) room.layerNames[obj.layerId] = nm; else delete room.layerNames[obj.layerId];
+              broadcast(room, JSON.stringify({ type:'layer_name', layerId: obj.layerId, name: nm || null, by: sock._cid }));
+              store.saveRoom(room.name, room);
+            }
+            break;
+          case 'board_search':   // ci356 整板文本搜索：在 text/note/pin/stamp/comment 的文字里不区分大小写查找，仅回给请求者(最多 50 条)，只读
+            {
+              const q = typeof obj.q === 'string' ? obj.q.trim() : '';
+              if(!q){ sendFrame(sock, JSON.stringify({ type:'error', code:'bad_query', msg:'board_search 需要非空关键词 q' })); break; }
+              const needle = q.toLowerCase().slice(0, 80);
+              const results = [];
+              for(const el of room.strokes){
+                if(!el || results.length >= 50) continue;
+                let hay = null;
+                if(typeof el.text === 'string') hay = el.text;              // text/note/stamp
+                else if(typeof el.label === 'string') hay = el.label;       // pin
+                if(hay && hay.toLowerCase().includes(needle)){
+                  results.push({ elId: el.id, type: el.type, snippet: hay.slice(0, 60), x: el.x, y: el.y });
+                  continue;
+                }
+                if(Array.isArray(el.comments)){                             // 元素评论
+                  const hit = el.comments.find(c => c && typeof c.text === 'string' && c.text.toLowerCase().includes(needle));
+                  if(hit) results.push({ elId: el.id, type: el.type, snippet: ('评论: ' + hit.text).slice(0, 60), x: el.x, y: el.y });
+                }
+              }
+              sendFrame(sock, JSON.stringify({ type:'search_results', q, results, count: results.length }));
             }
             break;
         }
