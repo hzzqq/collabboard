@@ -111,6 +111,22 @@ function clampCoord(v, min, max){
 function escapeXml(s){
   return String(s == null ? '' : s).replace(/[<>&'"]/g, c => ({ '<':'&lt;','>':'&gt;','&':'&amp;',"'":'&apos;','"':'&quot;' }[c]));
 }
+// 聊天文本净化（R2 隐性修复）：原 chat 处理直接 obj.text.slice(0,500)，
+// 若客户端发送非字符串 text(数字/null/对象) 会抛 TypeError 并可能中断房间；
+// 现统一校验+剔除控制字符+折叠空白+长度上限，非法/纯空白直接返回 null 由调用方丢弃。
+function sanitizeChatText(s){
+  if(typeof s !== 'string') return null;
+  let t = '';
+  for(const ch of s){
+    const cp = ch.codePointAt(0);
+    if(cp < 0x20 || cp === 0x7f) continue;   // 剔除全部控制字符(含 \r\n\t)与 DEL
+    if(cp > 0x10ffff) continue;
+    t += ch;
+  }
+  t = t.replace(/\s+/g, ' ').trim();          // 折叠连续空白为单空格并去首尾
+  if(!t) return null;                          // 纯空白视为空，丢弃
+  return t.slice(0, 500);                       // 长度上限(与既有广播一致)
+}
 // 密码哈希：不存明文，仅存服务端加盐哈希（隐性问题：避免密码明文落盘/泄露）
 function hashPassword(pwd){
   return crypto.createHash('sha256').update('collabboard::' + String(pwd)).digest('base64');
@@ -121,7 +137,8 @@ function presence(room){
   const ids = [...room.clients].map(c => c._cid);
   const avatars = [...room.clients].map(c => c.avatar || null);
   const statuses = [...room.clients].map(c => c.status || 'online');
-  broadcast(room, JSON.stringify({ type:'presence', count: room.clients.size, names, ids, avatars, statuses }));
+  const colors = [...room.clients].map(c => c.color || '#888');
+  broadcast(room, JSON.stringify({ type:'presence', count: room.clients.size, names, ids, avatars, statuses, colors }));
 }
 // 全局房间列表负载：所有房间名 + 笔画数 + 在线人数（供大厅展示活跃房间）
 function roomListPayload(){
@@ -178,6 +195,7 @@ function buildSnapshot(room){
     layerNames: room.layerNames || {},
     muted_list: room.muted ? [...room.muted] : [],
     lockedElements: room.lockedElements ? [...room.lockedElements] : [],
+    hiddenElements: room.hiddenElements ? [...room.hiddenElements] : [],
     pinnedChat: room.pinnedChat || null,
     spotlight: room.spotlight || null,
     announcements: room.announcements || [],
@@ -186,8 +204,26 @@ function buildSnapshot(room){
     reactions: room.reactions || {},
     locks: room.locks || {},
     roles: room.roles || {},
-    versions: (room.versions || []).map(v => ({ id: v.id, name: v.name, by: v.by, ts: v.ts }))
+    versions: (room.versions || []).map(v => ({ id: v.id, name: v.name, by: v.by, ts: v.ts })),
+    // ci400 隐性修复：此前快照缺在线成员与历史栈长度，迟到者拿不到头像/状态且无法反映可撤销状态
+    members: [...room.clients].map(c => ({
+      cid: c._cid, name: c.name || null, avatar: c.avatar || null,
+      status: c.status || 'online', color: c.color, isOwner: c._cid === room.owner
+    })),
+    gridCfg: room.gridCfg || null,
+    templates: room.templates ? Object.keys(room.templates) : [],
+    links: room.links || {},
+    historyLen: room.undoStack ? room.undoStack.length : 0,
+    futureLen: room.redoStack ? room.redoStack.length : 0
   };
+}
+// 撤销/重做后通知全员可撤销状态，并把内部栈别名到 room.history/room.future 便于快照/导出一致
+function notifyHistory(room){
+  if(!room.undoStack) room.undoStack = [];
+  if(!room.redoStack) room.redoStack = [];
+  room.history = room.undoStack;
+  room.future = room.redoStack;
+  broadcast(room, JSON.stringify({ type:'history_change', canUndo: room.undoStack.length > 0, canRedo: room.redoStack.length > 0 }));
 }
 
 // ---- 极简 HTTP 管理 API（非 WS 的 GET 请求走这里）----
@@ -244,7 +280,7 @@ function handleData(sock, buf, room){
         try{
           let obj = JSON.parse(msg);
           // 房间锁定时，非房主的编辑类操作被拒绝（仅回错误给发起者，不广播、不入栈）
-          const EDIT_OPS = new Set(['stroke','text','image','note','move','replace','clear','undo','redo','duplicate','rotate','delete','pin','group','ungroup','align','comment','shape','frame','apply_template']);
+          const EDIT_OPS = new Set(['stroke','text','image','note','move','replace','clear','undo','redo','duplicate','rotate','resize','set_element_visibility','delete','pin','group','ungroup','align','comment','shape','frame','apply_template','snap_element','zswap','ztoindex','paste_style','distribute']);
           if(EDIT_OPS.has(obj.type)){
             if(room.locked && sock._cid !== room.owner){
               sendFrame(sock, JSON.stringify({ type:'error', code:'locked', msg:'房间已锁定，仅房主可编辑' }));
@@ -410,13 +446,15 @@ function handleData(sock, buf, room){
             break;
           case 'move':
             {
+              // ci442 隐性修复：补齐与 resize(ci427) 一致的 host-only/view 权限守卫（此前 move 漏检，导致 host-only 房间非房主仍可移动）
+              if(room.permissions && room.permissions !== 'all' && sock._cid !== room.owner){ sendFrame(sock, JSON.stringify({ type:'error', code:'no_edit_permission', msg:'当前权限下你无法移动元素' })); break; }
               const dx = +obj.dx||0, dy = +obj.dy||0;
               const ids = (obj.ids && Array.isArray(obj.ids)) ? obj.ids
                         : (obj.id != null ? [obj.id] : null);
               if(!ids || ids.length === 0 || (dx === 0 && dy === 0)) break;
               let found = false;
               const moved = room.strokes.map(el => {
-                if(el && ids.includes(el.id)){ found = true; return translateElement(el, dx, dy); }
+                if(el && ids.includes(el.id)){ found = true; const c = JSON.parse(JSON.stringify(el)); translateElement(c, dx, dy); return c; }
                 return el;
               });
               if(!found) break;                         // 没找到任何 id 直接忽略
@@ -433,6 +471,9 @@ function handleData(sock, buf, room){
               const action = obj.action;
               if(!ids || ids.length === 0) break;
               if(!['front','back','raise','lower'].includes(action)) break;
+              // ci447 隐性修复：补齐与 zswap/rotate/resize 一致的 host-only/view 权限守卫与元素锁守卫（此前 zorder 漏检，非房主在受限房间仍可改层级）
+              if(room.permissions && room.permissions !== 'all' && sock._cid !== room.owner){ sendFrame(sock, JSON.stringify({ type:'error', code:'no_edit_permission', msg:'当前权限下你无法调整层级' })); break; }
+              if(sock._cid !== room.owner && ids.some(id => room.lockedElements.has(id))){ sendFrame(sock, JSON.stringify({ type:'error', code:'element_locked', msg:'该元素已被锁定，仅房主可调整层级' })); break; }
               const set = new Set(ids);
               const sel = room.strokes.filter(el => el && set.has(el.id));
               if(sel.length === 0) break;                 // 没有命中任何 id 则忽略
@@ -460,21 +501,67 @@ function handleData(sock, buf, room){
             }
             break;
           case 'replace': hist.commitStrokes(room, obj.strokes || []); broadcast(room, msg, sock); store.saveRoom(room.name, room); break;
+          case 'zswap':   // ci442 新增：两两交换两个元素的层级(zorder 此前仅有 front/back/raise/lower，缺 pairwise swap)
+            {
+              const a = obj.idA, b = obj.idB;
+              if(a == null || b == null || a === b) break;
+              if(room.permissions && room.permissions !== 'all' && sock._cid !== room.owner){ sendFrame(sock, JSON.stringify({ type:'error', code:'no_edit_permission', msg:'当前权限下你无法调整层级' })); break; }
+              // 元素锁：任一目标元素被锁且非房主则拒绝（中央守卫仅识别 obj.id/obj.ids，这里显式覆盖 idA/idB）
+              if(sock._cid !== room.owner && (room.lockedElements.has(a) || room.lockedElements.has(b))){ sendFrame(sock, JSON.stringify({ type:'error', code:'element_locked', msg:'该元素已被锁定，仅房主可调整层级' })); break; }
+              const ia = room.strokes.findIndex(el => el && el.id === a);
+              const ib = room.strokes.findIndex(el => el && el.id === b);
+              if(ia < 0 || ib < 0) break;                  // 任一 id 不存在则忽略
+              const arr = room.strokes.slice();
+              const t = arr[ia]; arr[ia] = arr[ib]; arr[ib] = t;   // 交换两者在数组中的次序(数组末=最上层)
+              hist.commitStrokes(room, arr);
+              broadcast(room, JSON.stringify({ type:'replace', strokes: room.strokes }));
+              store.saveRoom(room.name, room);
+            }
+            break;
+          case 'ztoindex':   // ci447 新增：将元素移到指定层级 index（0=最底, len-1=最顶）；支持批量按相对顺序插入到目标位置
+            {
+              const ids = (obj.ids && Array.isArray(obj.ids)) ? obj.ids : (obj.id != null ? [obj.id] : null);
+              let index = obj.index;
+              if(!ids || ids.length === 0) break;
+              if(typeof index !== 'number' || !isFinite(index)) index = 0;
+              index = Math.floor(index);
+              if(index < 0) index = 0;
+              if(index > room.strokes.length) index = room.strokes.length;
+              // 与 zorder/zswap 一致的权限与元素锁守卫
+              if(room.permissions && room.permissions !== 'all' && sock._cid !== room.owner){ sendFrame(sock, JSON.stringify({ type:'error', code:'no_edit_permission', msg:'当前权限下你无法调整层级' })); break; }
+              if(sock._cid !== room.owner && ids.some(id => room.lockedElements.has(id))){ sendFrame(sock, JSON.stringify({ type:'error', code:'element_locked', msg:'该元素已被锁定，仅房主可调整层级' })); break; }
+              const set = new Set(ids);
+              const sel = [];
+              for(const id of ids){ const el = room.strokes.find(e => e && e.id === id); if(el) sel.push(el); }  // 按 ids 传入顺序保持相对次序
+              if(sel.length === 0) break;                       // 没命中任何 id 则忽略
+              const rest = room.strokes.filter(el => !(el && set.has(el.id)));
+              const arr = rest.slice();
+              const insertAt = Math.max(0, Math.min(index, rest.length));
+              arr.splice(insertAt, 0, ...sel);                 // 按原相对顺序插入到目标层级
+              hist.commitStrokes(room, arr);
+              broadcast(room, JSON.stringify({ type:'replace', strokes: room.strokes }));
+              store.saveRoom(room.name, room);
+            }
+            break;
           case 'clear':   hist.commitStrokes(room, []); broadcast(room, msg, sock); store.saveRoom(room.name, room); break;
           case 'undo':
             if(hist.undo(room)){
               const rmsg = JSON.stringify({ type:'replace', strokes: room.strokes });
               broadcast(room, rmsg); store.saveRoom(room.name, room);
+              notifyHistory(room);   // 广播 history_change{canUndo,canRedo}
             }
             break;
           case 'redo':
             if(hist.redo(room)){
               const rmsg = JSON.stringify({ type:'replace', strokes: room.strokes });
               broadcast(room, rmsg); store.saveRoom(room.name, room);
+              notifyHistory(room);   // 广播 history_change{canUndo,canRedo}
             }
             break;
           case 'duplicate':
             {
+              // ci451 隐性修复：补齐 host-only/view 权限守卫（此前 duplicate 漏检，非房主在受限房间仍可复制元素，与 rotate/resize/zorder 不一致）
+              if(room.permissions && room.permissions !== 'all' && sock._cid !== room.owner){ sendFrame(sock, JSON.stringify({ type:'error', code:'no_edit_permission', msg:'当前权限下你无法复制元素' })); break; }
               const ids = (obj.ids && Array.isArray(obj.ids)) ? obj.ids
                         : (obj.id != null ? [obj.id] : null);
               if(!ids || ids.length === 0) break;
@@ -497,8 +584,34 @@ function handleData(sock, buf, room){
               store.saveRoom(room.name, room);
             }
             break;
+          case 'paste_style':   // ci451 新增：把源元素的视觉样式复制到目标元素（不改动几何/内容/层级）
+            {
+              // 与 rotate/resize 一致：host-only/view 权限下非房主不可粘贴样式
+              if(room.permissions && room.permissions !== 'all' && sock._cid !== room.owner){ sendFrame(sock, JSON.stringify({ type:'error', code:'no_edit_permission', msg:'当前权限下你无法粘贴样式' })); break; }
+              const fromId = obj.from;
+              const ids = (obj.ids && Array.isArray(obj.ids)) ? obj.ids
+                        : (obj.id != null ? [obj.id] : null);
+              if(fromId == null || !ids || ids.length === 0) break;
+              const src = room.strokes.find(el => el && el.id === fromId);
+              if(!src) break;   // 源元素不存在则忽略（不报错，避免客户端误传崩溃）
+              // 仅复制“视觉样式”字段，保留目标元素的几何/内容/层级/身份
+              const STYLE_FIELDS = ['color','strokeWidth','fill','opacity','dash','lineCap','lineJoin','fontSize','fontFamily','fontWeight'];
+              const set = new Set(ids);
+              const arr = room.strokes.map(el => {
+                if(!set.has(el.id)) return el;
+                const c = JSON.parse(JSON.stringify(el));   // 深拷贝，避免共用引用污染撤销栈快照
+                for(const f of STYLE_FIELDS){ if(f in src) c[f] = JSON.parse(JSON.stringify(src[f])); }
+                return c;
+              });
+              hist.commitStrokes(room, arr);                 // 旧状态进撤销栈
+              broadcast(room, JSON.stringify({ type:'replace', strokes: room.strokes }), sock);
+              store.saveRoom(room.name, room);
+            }
+            break;
           case 'rotate':
             {
+              // ci442 隐性修复：补齐与 resize(ci427) 一致的 host-only/view 权限守卫（此前 rotate 漏检）
+              if(room.permissions && room.permissions !== 'all' && sock._cid !== room.owner){ sendFrame(sock, JSON.stringify({ type:'error', code:'no_edit_permission', msg:'当前权限下你无法旋转元素' })); break; }
               const ids = (obj.ids && Array.isArray(obj.ids)) ? obj.ids
                         : (obj.id != null ? [obj.id] : null);
               let deg = Math.round(+obj.deg || 0);
@@ -522,6 +635,32 @@ function handleData(sock, buf, room){
                 return rotateElement(c, deg, cx, cy);
               });
               hist.commitStrokes(room, arr);                   // 传新数组，旧状态进撤销栈
+              broadcast(room, JSON.stringify({ type:'replace', strokes: room.strokes }), sock);
+              store.saveRoom(room.name, room);
+            }
+            break;
+          case 'resize':   // ci427 元素缩放：统一设置 w/h，深拷贝进撤销栈；受房间锁/权限/元素锁约束
+            {
+              // 隐性修复：view/host-only 权限下非房主不可缩放（rotate/delete 此前漏检权限，这里补上）
+              if(room.permissions && room.permissions !== 'all' && sock._cid !== room.owner){ sendFrame(sock, JSON.stringify({ type:'error', code:'no_edit_permission', msg:'当前权限下你无法缩放元素' })); break; }
+              const ids = (obj.ids && Array.isArray(obj.ids)) ? obj.ids
+                        : (obj.id != null ? [obj.id] : null);
+              let w = +obj.w, h = +obj.h;
+              if(!ids || ids.length === 0) break;
+              if(!Number.isFinite(w) || !Number.isFinite(h)) break;   // 拒绝非有限尺寸，防 NaN/Infinity 污染渲染
+              w = Math.max(1, Math.min(w, 100000));                    // 钳制到合理区间，防越界
+              h = Math.max(1, Math.min(h, 100000));
+              const set = new Set(ids);
+              const sel = room.strokes.filter(el => el && set.has(el.id));
+              if(sel.length === 0) break;                            // 没命中任何 id 则忽略
+              // 深拷贝选中元素后再改 w/h，避免原地修改污染撤销栈快照（历史需保留缩放前状态）
+              const arr = room.strokes.map(el => {
+                if(!set.has(el.id)) return el;
+                const c = JSON.parse(JSON.stringify(el));
+                c.w = w; c.h = h;
+                return c;
+              });
+              hist.commitStrokes(room, arr);                          // 传新数组，旧状态进撤销栈
               broadcast(room, JSON.stringify({ type:'replace', strokes: room.strokes }), sock);
               store.saveRoom(room.name, room);
             }
@@ -581,6 +720,8 @@ function handleData(sock, buf, room){
             break;
           case 'align':
             {
+              // ci455 隐性修复：补齐与 rotate/resize/zorder 一致的 host-only/view 权限守卫（此前 align 漏检，host-only 房间非房主仍可对齐/移动元素）
+              if(room.permissions && room.permissions !== 'all' && sock._cid !== room.owner){ sendFrame(sock, JSON.stringify({ type:'error', code:'no_edit_permission', msg:'当前权限下你无法对齐元素' })); break; }
               const ids = Array.isArray(obj.ids) ? obj.ids : null;
               const how = obj.how;
               const HORIZ = new Set(['left','center','right']), VERT = new Set(['top','middle','bottom']);
@@ -592,9 +733,11 @@ function handleData(sock, buf, room){
               if(sel.length === 1) break;
               // 元素包围盒
               const bboxOf = (el) => {
+                const PX = (p)=> (p && typeof p === 'object' && p.x !== undefined) ? p.x : (Array.isArray(p) ? p[0] : 0);
+                const PY = (p)=> (p && typeof p === 'object' && p.y !== undefined) ? p.y : (Array.isArray(p) ? p[1] : 0);
                 if(Array.isArray(el.points) && el.points.length){
                   let x0=Infinity,y0=Infinity,x1=-Infinity,y1=-Infinity;
-                  for(const p of el.points){ x0=Math.min(x0,p.x||0); y0=Math.min(y0,p.y||0); x1=Math.max(x1,p.x||0); y1=Math.max(y1,p.y||0); }
+                  for(const p of el.points){ const px=PX(p), py=PY(p); x0=Math.min(x0,px); y0=Math.min(y0,py); x1=Math.max(x1,px); y1=Math.max(y1,py); }
                   return { x0, y0, x1, y1 };
                 }
                 const x = el.x||0, y = el.y||0; return { x0:x, y0:y, x1:x, y1:y };
@@ -605,7 +748,7 @@ function handleData(sock, buf, room){
               const sCx = (sX0+sX1)/2, sCy = (sY0+sY1)/2;
               const translate = (el, dx, dy) => {
                 const c = JSON.parse(JSON.stringify(el));
-                if(Array.isArray(c.points)){ for(const p of c.points){ p.x=(p.x||0)+dx; p.y=(p.y||0)+dy; } }
+                if(Array.isArray(c.points)){ for(const p of c.points){ if(p && typeof p === 'object' && p.x !== undefined){ p.x=(p.x||0)+dx; p.y=(p.y||0)+dy; } else if(Array.isArray(p)){ p[0]=(p[0]||0)+dx; p[1]=(p[1]||0)+dy; } } }
                 else { c.x=(c.x||0)+dx; c.y=(c.y||0)+dy; }
                 return c;
               };
@@ -624,6 +767,53 @@ function handleData(sock, buf, room){
                   else dy = sCy - (b.y0+b.y1)/2;            // middle
                 }
                 return translate(el, dx, dy);
+              });
+              hist.commitStrokes(room, arr);
+              broadcast(room, JSON.stringify({ type:'replace', strokes: room.strokes }), sock);
+              store.saveRoom(room.name, room);
+            }
+            break;
+          case 'distribute':   // ci455 新增：均匀分布(distribute)——与 align(对齐) 互补，把选中元素沿轴等间距排布(首末不动)
+            {
+              // 与 rotate/resize/align 一致的 host-only/view 权限守卫
+              if(room.permissions && room.permissions !== 'all' && sock._cid !== room.owner){ sendFrame(sock, JSON.stringify({ type:'error', code:'no_edit_permission', msg:'当前权限下你无法均匀分布元素' })); break; }
+              const ids = Array.isArray(obj.ids) ? obj.ids : null;
+              const how = obj.how;
+              const H = how === 'h' || how === 'horizontal';
+              const V = how === 'v' || how === 'vertical';
+              if(!ids || ids.length < 3 || (!H && !V)) break;   // 至少 3 个元素才有分布意义
+              const set = new Set(ids);
+              const sel = room.strokes.filter(el => el && set.has(el.id));
+              if(sel.length < 3) break;                         // 命中不足则忽略
+              const bboxOf = (el) => {
+                const PX = (p)=> (p && typeof p === 'object' && p.x !== undefined) ? p.x : (Array.isArray(p) ? p[0] : 0);
+                const PY = (p)=> (p && typeof p === 'object' && p.y !== undefined) ? p.y : (Array.isArray(p) ? p[1] : 0);
+                if(Array.isArray(el.points) && el.points.length){
+                  let x0=Infinity,y0=Infinity,x1=-Infinity,y1=-Infinity;
+                  for(const p of el.points){ const px=PX(p), py=PY(p); x0=Math.min(x0,px); y0=Math.min(y0,py); x1=Math.max(x1,px); y1=Math.max(y1,py); }
+                  return { x0, y0, x1, y1 };
+                }
+                const x = el.x||0, y = el.y||0; return { x0:x, y0:y, x1:x, y1:y };
+              };
+              // 取元素中心作为分布依据坐标
+              const coord = (el) => { const b = bboxOf(el); return H ? (b.x0+b.x1)/2 : (b.y0+b.y1)/2; };
+              const sorted = sel.slice().sort((a,b)=> coord(a)-coord(b));   // 沿轴排序
+              const first = coord(sorted[0]);
+              const last = coord(sorted[sorted.length-1]);
+              const n = sorted.length;
+              const step = (last - first) / (n - 1);             // 等间距步长(首末固定)
+              const target = new Map();
+              for(let i=0;i<n;i++) target.set(sorted[i].id, first + step*i);
+              const dtranslate = (el, dx, dy) => {
+                const c = JSON.parse(JSON.stringify(el));         // 深拷贝，避免污染撤销栈快照
+                if(Array.isArray(c.points)){ for(const p of c.points){ if(p && typeof p === 'object' && p.x !== undefined){ p.x=(p.x||0)+dx; p.y=(p.y||0)+dy; } else if(Array.isArray(p)){ p[0]=(p[0]||0)+dx; p[1]=(p[1]||0)+dy; } } }
+                else { c.x=(c.x||0)+dx; c.y=(c.y||0)+dy; }
+                return c;
+              };
+              const arr = room.strokes.map(el => {
+                if(!set.has(el.id)) return el;
+                const d = target.get(el.id) - coord(el);          // 需平移量
+                return dtranslate(el, H ? d : 0, V ? d : 0);
               });
               hist.commitStrokes(room, arr);
               broadcast(room, JSON.stringify({ type:'replace', strokes: room.strokes }), sock);
@@ -691,14 +881,46 @@ function handleData(sock, buf, room){
             sock.name = String(obj.name || '').slice(0, 24) || sock.name;
             presence(room); break;
           case 'set_avatar':
-            sock.avatar = String(obj.avatar || '').slice(0, 8) || sock.avatar;
-            broadcast(room, JSON.stringify({ type:'avatar', id: sock._cid, avatar: sock.avatar }));  // 广播头像给他人(不落库)
+            {
+              // ci404 隐性修复：原先不校验头像类型/非空，非法输入会静默无操作；现拒绝并返回 bad_avatar
+              const av = (typeof obj.avatar === 'string') ? obj.avatar.slice(0, 8) : '';
+              if(!av){ sendFrame(sock, JSON.stringify({ type:'error', code:'bad_avatar', msg:'set_avatar 需要非空字符串头像' })); break; }
+              sock.avatar = av;
+              broadcast(room, JSON.stringify({ type:'avatar', id: sock._cid, avatar: av }));            // 兼容旧客户端
+              broadcast(room, JSON.stringify({ type:'member_avatar', cid: sock._cid, avatar: av }));     // 规范帧(含请求者)
+            }
             break;
           case 'set_status':
             {  // 设置自身在线状态(online/away/busy 或自定义短文本)，更新后广播 presence 给全员
               const st = typeof obj.status === 'string' ? obj.status.trim().slice(0, 16) : '';
               sock.status = st || 'online';
               presence(room); break;
+            }
+          case 'set_nickname_color':
+            {  // ci423 新增：用户自定义自身光标/昵称颜色(覆盖服务端调色板分配)，校验后更新并广播
+              const s = (typeof obj.color === 'string') ? obj.color.trim() : '';
+              if(!/^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.test(s)){ sendFrame(sock, JSON.stringify({ type:'error', code:'bad_color', msg:'颜色需为 #rgb 或 #rrggbb' })); break; }
+              sock.color = s.toLowerCase();
+              broadcast(room, JSON.stringify({ type:'nickname_color', id: sock._cid, color: sock.color, name: sock.name || '匿名' }));
+              presence(room); break;   // presence 现携带 colors，全员即时同步新色
+            }
+          case 'link_element':   // ci424 给元素挂/卸超链接：校验 id 存在与 url 协议，广播 element_link，快照含 links
+            {
+              const id = (typeof obj.id === 'string') ? obj.id : '';
+              const url = (typeof obj.url === 'string') ? obj.url.trim() : '';
+              if(!id){ sendFrame(sock, JSON.stringify({ type:'error', code:'bad_el', msg:'link_element 需要元素 id' })); break; }
+              const el = room.strokes.find(s => s && s.id === id);
+              if(!el){ sendFrame(sock, JSON.stringify({ type:'error', code:'no_such_element', msg:'元素不存在' })); break; }
+              if(url.length === 0){   // 空 url 视为清除链接
+                if(room.links) delete room.links[id];
+                broadcast(room, JSON.stringify({ type:'element_link', id, url: '', by: sock._cid }));
+                store.saveRoom(room.name, room); break;
+              }
+              if(!/^https?:\/\/|^mailto:/i.test(url) || url.length > 2000){ sendFrame(sock, JSON.stringify({ type:'error', code:'bad_url', msg:'链接需以 http(s):// 或 mailto: 开头且长度≤2000' })); break; }
+              room.links = room.links || {};
+              room.links[id] = url;
+              broadcast(room, JSON.stringify({ type:'element_link', id, url, by: sock._cid }));
+              store.saveRoom(room.name, room); break;
             }
           case 'set_permissions': {   // 房主设置编辑权限：all(默认) / host-only(仅房主可画) / view(仅房主可画，等同只读)
             if(sock._cid !== room.owner){ sendFrame(sock, JSON.stringify({ type:'error', code:'not_owner', msg:'仅房主可设置编辑权限' })); break; }
@@ -743,7 +965,6 @@ function handleData(sock, buf, room){
             break;
           }
           case 'chat':
-            if(typeof obj.text !== 'string') break;
             if(room.muted.has(sock._cid)){ sendFrame(sock, JSON.stringify({ type:'error', code:'muted', msg:'你已被房主禁言' })); break; }
             if(room.slowMode > 0){
               const now = Date.now();
@@ -752,7 +973,9 @@ function handleData(sock, buf, room){
               if(gap > 0){ sendFrame(sock, JSON.stringify({ type:'error', code:'slow_mode', msg:'发言过于频繁，请 ' + Math.ceil(gap/1000) + 's 后再试' })); break; }
               room._chatAt[sock._cid] = now;
             }
-            const chat = { type:'chat', id: sock._cid || '?', name: sock.name || '匿名', text: obj.text.slice(0, 500), t: Date.now(), mid: ++room._chatSeq, reactions: {} };
+            const text = sanitizeChatText(obj.text);   // R2：非字符串/含控制字符/纯空白 一律丢弃, 不广播
+            if(!text) break;
+            const chat = { type:'chat', id: sock._cid || '?', name: sock.name || '匿名', text: text, t: Date.now(), mid: ++room._chatSeq, reactions: {} };
             room.chats.push(chat);
             if(room.chats.length > 50) room.chats.shift();
             broadcast(room, JSON.stringify(chat), sock);   // 仅转发给他人
@@ -1196,7 +1419,8 @@ function handleData(sock, buf, room){
               break;
             }
             { room.grid = obj.on === true ? true : (obj.on === false ? false : !room.grid);
-              broadcast(room, JSON.stringify({ type:'grid_toggle', on: !!room.grid, by: room.owner })); }
+              broadcast(room, JSON.stringify({ type:'grid_toggle', on: !!room.grid, by: room.owner }));
+              store.saveRoom(room.name, room); }   // ci408 隐性修复：此前网格显示状态未持久化，重启即丢失
             break;
           case 'snap_toggle':   // 房主切换吸附网格：room.snap 布尔，广播
             if(sock._cid !== room.owner){
@@ -1204,7 +1428,36 @@ function handleData(sock, buf, room){
               break;
             }
             { room.snap = obj.on === true ? true : (obj.on === false ? false : !room.snap);
-              broadcast(room, JSON.stringify({ type:'snap_toggle', on: !!room.snap, by: room.owner })); }
+              broadcast(room, JSON.stringify({ type:'snap_toggle', on: !!room.snap, by: room.owner }));
+              store.saveRoom(room.name, room); }   // ci408 隐性修复：此前吸附状态未持久化，重启即丢失
+            break;
+          case 'set_grid':   // ci408 房间级网格参数：room.gridCfg={x,y,size}（与 room.grid 布尔显示解耦，避免碰撞）；房主；广播 grid{...} 并持久化
+            {
+              if(sock._cid !== room.owner){ sendFrame(sock, JSON.stringify({ type:'error', code:'not_owner', msg:'只有房主能设置网格参数' })); break; }
+              const cfg = (obj && typeof obj.grid === 'object' && obj.grid) ? obj.grid : obj;
+              const x = Math.max(0, Math.min(100000, +cfg.x || 0));
+              const y = Math.max(0, Math.min(100000, +cfg.y || 0));
+              const size = Math.max(0, Math.min(100000, +cfg.size || 0));   // size=0 表示关闭吸附
+              room.gridCfg = { x, y, size };
+              broadcast(room, JSON.stringify({ type:'grid', x, y, size, by: sock._cid }));
+              store.saveRoom(room.name, room);
+            }
+            break;
+          case 'snap_element':   // ci408 把某元素坐标吸附到网格(room.gridCfg.size)；更新元素、进撤销栈、广播 element_snapped、持久化
+            {
+              const id = (typeof obj.elId === 'string') ? obj.elId : (typeof obj.id === 'string' ? obj.id : '');
+              if(!id){ sendFrame(sock, JSON.stringify({ type:'error', code:'bad_elId', msg:'snap_element 需要有效的 elId' })); break; }
+              const el = room.strokes.find(s => s && s.id === id);
+              if(!el){ sendFrame(sock, JSON.stringify({ type:'error', code:'no_such_element', msg:'该元素不存在' })); break; }
+              const g = room.gridCfg || { x:0, y:0, size:0 };
+              if(!(g.size > 0)){ sendFrame(sock, JSON.stringify({ type:'error', code:'no_grid', msg:'房间未启用网格吸附(size>0)' })); break; }
+              const nx = g.x + Math.round((el.x - g.x) / g.size) * g.size;
+              const ny = g.y + Math.round((el.y - g.y) / g.size) * g.size;
+              const arr = room.strokes.map(s => { if(s && s.id === id){ const c = JSON.parse(JSON.stringify(s)); c.x = nx; c.y = ny; return c; } return s; });
+              hist.commitStrokes(room, arr);
+              broadcast(room, JSON.stringify({ type:'element_snapped', elId: id, x: nx, y: ny, by: sock._cid }), sock);
+              store.saveRoom(room.name, room);
+            }
             break;
           case 'shape':   // 矢量图形基本图元：rect/ellipse/line/triangle（持久化、可撤销、受房间锁/元素锁约束）
             {
@@ -1353,8 +1606,34 @@ function handleData(sock, buf, room){
               sendFrame(sock, JSON.stringify({ type:'versions', versions: room.versions.map(v => ({ id:v.id, name:v.name, by:v.by, ts:v.ts })), by: sock._cid }));
             }
             break;
-          case 'apply_template':   // 应用内置模板（白板/四象限），仅允许名单内模板，避免任意元素注入；可撤销
+          case 'save_template':   // ci412 保存命名元素模板(样式/组合)：room.templates[name]={name,elements,by}；房主；广播 template_saved；持久化
             {
+              if(sock._cid !== room.owner){ sendFrame(sock, JSON.stringify({ type:'error', code:'not_owner', msg:'只有房主能保存模板' })); break; }
+              const name = (typeof obj.name === 'string') ? obj.name.trim().slice(0, 40) : '';
+              if(!name){ sendFrame(sock, JSON.stringify({ type:'error', code:'bad_name', msg:'save_template 需要模板名' })); break; }
+              const els = Array.isArray(obj.elements) ? obj.elements : [];
+              if(els.length === 0){ sendFrame(sock, JSON.stringify({ type:'error', code:'empty_template', msg:'模板至少含一个元素' })); break; }
+              // 仅接受已知安全字段，避免任意对象/原型注入
+              const ALLOW = ['type','x','y','w','h','text','label','color','fill','size','rotation','shapeKind'];
+              const clean = els.slice(0, 50).map(e => { const o = {}; for(const k of ALLOW) if(e[k] !== undefined) o[k] = e[k]; return o; });
+              room.templates = room.templates || {};
+              room.templates[name] = { name, elements: clean, by: sock._cid, ts: Date.now() };
+              broadcast(room, JSON.stringify({ type:'template_saved', name, by: sock._cid, count: Object.keys(room.templates).length }));
+              store.saveRoom(room.name, room);
+            }
+            break;
+          case 'list_templates':   // ci412 列出已保存模板(仅回请求者，含轻量元信息)
+            {
+              room.templates = room.templates || {};
+              sendFrame(sock, JSON.stringify({ type:'templates', templates: Object.keys(room.templates).map(k => ({ name:k, by: room.templates[k].by, count: room.templates[k].elements.length })), by: sock._cid }));
+            }
+            break;
+          case 'apply_template':   // 应用内置或用户保存模板，按模板创建新元素；可撤销；受房间权限约束
+            {
+              if(room.permissions && room.permissions !== 'all' && sock._cid !== room.owner){   // ci412 隐性修复：原先未校验房间权限，view 模式下 viewers 也能应用模板
+                sendFrame(sock, JSON.stringify({ type:'error', code:'no_edit_permission', msg:'当前权限下你无法应用模板' }));
+                break;
+              }
               const name = (typeof obj.name === 'string') ? obj.name : '';
               const TEMPLATES = {
                 brain: [ {type:'frame', x:40,y:40,w:360,h:240,label:'想法',color:'#82aaff'},
@@ -1366,9 +1645,11 @@ function handleData(sock, buf, room){
                          {type:'frame', x:40,y:280,w:300,h:200,label:'3',color:'#add7ff'},
                          {type:'frame', x:380,y:280,w:300,h:200,label:'4',color:'#add7ff'} ]
               };
-              const tpl = TEMPLATES[name];
-              if(!tpl){ sendFrame(sock, JSON.stringify({ type:'error', code:'bad_template', msg:'未知模板：' + name })); break; }
-              const news = tpl.map(el => Object.assign({}, el, { id: sock._cid + ':' + (++strokeSeq), author: sock._cid, authorColor: sock.color }));
+              let src = TEMPLATES[name];
+              room.templates = room.templates || {};
+              if(!src && room.templates[name]) src = room.templates[name].elements;   // 优先内置，其次用户模板
+              if(!src){ sendFrame(sock, JSON.stringify({ type:'error', code:'bad_template', msg:'未知模板：' + name })); break; }
+              const news = src.map(el => Object.assign({}, el, { id: sock._cid + ':' + (++strokeSeq), author: sock._cid, authorColor: sock.color }));
               hist.commitStrokes(room, room.strokes.concat(news));
               broadcast(room, JSON.stringify({ type:'replace', strokes: room.strokes }), sock);
               store.saveRoom(room.name, room);
@@ -1423,15 +1704,25 @@ function handleData(sock, buf, room){
               const fmt = (typeof obj.format === 'string') ? obj.format : 'json';
               if(fmt !== 'json' && fmt !== 'svg'){ sendFrame(sock, JSON.stringify({ type:'error', code:'bad_format', msg:'export 仅支持 json/svg' })); break; }
               if(fmt === 'json'){
-                const data = { name: room.name, bg: room.bg, title: room.title, permissions: room.permissions || 'all',
-                  grid: !!room.grid, snap: !!room.snap, locked: !!room.locked,
+                // ci416 隐性修复：原先 json 导出遗漏 stars/layerNames/timer/votes/reactions/locks/versions/templates/members，
+                // 与 buildSnapshot 不一致；现补齐，保证导出与迟到者看到的全量状态一致
+                const data = {
+                  name: room.name, bg: room.bg, title: room.title, permissions: room.permissions || 'all',
+                  grid: !!room.grid, gridCfg: room.gridCfg || null, snap: !!room.snap, locked: !!room.locked,
                   strokes: room.strokes, chats: room.chats,
-                  polls: room.polls.map(serializePoll), timers: room.timers.map(serializeTimer) };
+                  polls: room.polls.map(serializePoll), timers: room.timers.map(serializeTimer),
+                  stars: room.stars || {}, layerNames: room.layerNames || {},
+                  timer: room.timer || null, votes: room.votes || {}, reactions: room.reactions || {},
+                  locks: room.locks || {}, roles: room.roles || {}, hiddenElements: room.hiddenElements ? [...room.hiddenElements] : [],
+                  versions: (room.versions || []).map(v => ({ id: v.id, name: v.name, by: v.by, ts: v.ts })),
+                  templates: room.templates ? Object.keys(room.templates) : [],
+                  members: [...room.clients].map(c => ({ cid: c._cid, name: c.name || null, avatar: c.avatar || null, status: c.status || 'online', color: c.color, isOwner: c._cid === room.owner }))
+                };
                 sendFrame(sock, JSON.stringify({ type:'board_export', format:'json', data }));
               } else {
                 let svg = '<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="800">';
                 if(room.bg) svg += '<rect width="100%" height="100%" fill="'+room.bg+'"/>';
-                for(const el of room.strokes){
+                for(const el of room.strokes){ if(room.hiddenElements && room.hiddenElements.has(el.id)) continue;   // 隐藏元素不进入 SVG 导出
                   if(el.type === 'frame' || el.shapeKind === 'rect' || el.shapeKind === 'triangle'){ svg += '<rect x="'+clampCoord(el.x,0,1e6)+'" y="'+clampCoord(el.y,0,1e6)+'" width="'+clampCoord(el.w,0,1e6)+'" height="'+clampCoord(el.h,0,1e6)+'" fill="'+(el.fill||'none')+'" stroke="'+el.color+'"/>'; }
                   else if(el.shapeKind === 'ellipse'){ svg += '<ellipse cx="'+(clampCoord(el.x,0,1e6)+clampCoord(el.w,0,1e6)/2)+'" cy="'+(clampCoord(el.y,0,1e6)+clampCoord(el.h,0,1e6)/2)+'" rx="'+(clampCoord(el.w,0,1e6)/2)+'" ry="'+(clampCoord(el.h,0,1e6)/2)+'" fill="none" stroke="'+el.color+'"/>'; }
                   else if(el.type === 'text'){ svg += '<text x="'+clampCoord(el.x,0,1e6)+'" y="'+clampCoord(el.y,0,1e6)+'" fill="'+el.color+'">'+escapeXml(el.text)+'</text>'; }
@@ -1489,6 +1780,7 @@ function handleData(sock, buf, room){
               if(!el){ sendFrame(sock, JSON.stringify({ type:'error', code:'no_such_element', msg:'该元素不存在' })); break; }
               room.elementFocus = { elId: el.id, by: sock._cid, at: Date.now() };
               broadcast(room, JSON.stringify({ type:'focus_element_on', elId: el.id, by: sock._cid }));
+              broadcast(room, JSON.stringify({ type:'focus', by: sock._cid, elId: el.id }));   // ci404 规范帧：谁聚焦某元素
             }
             break;
           case 'focus_element_off':   // ci336 房主关闭元素聚焦：清空 room.elementFocus，广播 focus_element_off（无聚焦时报错）
@@ -1548,6 +1840,21 @@ function handleData(sock, buf, room){
               if(!room.layerNames || typeof room.layerNames !== 'object') room.layerNames = {};
               if(nm) room.layerNames[obj.layerId] = nm; else delete room.layerNames[obj.layerId];
               broadcast(room, JSON.stringify({ type:'layer_name', layerId: obj.layerId, name: nm || null, by: sock._cid }));
+              store.saveRoom(room.name, room);
+            }
+            break;
+          case 'set_element_visibility':   // ci429 元素显隐：room.hiddenElements Set，广播 element_visibility，快照/导出含 hiddenElements(隐性修复：导出与快照一致)
+            {
+              const id = (typeof obj.id === 'string') ? obj.id : '';
+              if(!id){ sendFrame(sock, JSON.stringify({ type:'error', code:'bad_el', msg:'set_element_visibility 需要元素 id' })); break; }
+              const el = room.strokes.find(s => s && s.id === id);
+              if(!el){ sendFrame(sock, JSON.stringify({ type:'error', code:'no_such_element', msg:'元素不存在' })); break; }
+              // 仅房主或元素作者可切换显隐，避免他人随意隐藏别人的内容
+              if(sock._cid !== room.owner && el.author !== sock._cid){ sendFrame(sock, JSON.stringify({ type:'error', code:'not_allowed', msg:'仅房主或元素作者可切换显隐' })); break; }
+              const hidden = !!obj.hidden;
+              if(!room.hiddenElements || !(room.hiddenElements instanceof Set)) room.hiddenElements = new Set();
+              if(hidden) room.hiddenElements.add(id); else room.hiddenElements.delete(id);
+              broadcast(room, JSON.stringify({ type:'element_visibility', id, hidden, by: sock._cid }));   // 广播全员(含发送者)以服务端为准
               store.saveRoom(room.name, room);
             }
             break;
