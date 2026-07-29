@@ -472,6 +472,8 @@ $('zLower').onclick = ()=> zorder('lower');
 $('zBack').onclick = ()=> zorder('back');
 function duplicateSel(){ if(selectedIds.size === 0) return; send({ type:'duplicate', ids:[...selectedIds] }); }
 $('dupBtn').onclick = duplicateSel;
+function pasteStyleSel(){ if(selectedIds.size < 2) return; const ids = [...selectedIds]; send({ type:'paste_style', from: ids[0], ids: ids.slice(1) }); }
+$('pasteStyleBtn').onclick = pasteStyleSel;
 function groupSel(){ if(selectedIds.size === 0) return; const gid = myId + ':g' + (++localSeq); send({ type:'group', ids:[...selectedIds], group: gid }); for(const s of strokes){ if(s && selectedIds.has(s.id)) s.group = gid; } redraw(); }
 $('groupBtn').onclick = groupSel;
 $('lockElBtn').onclick = lockSel;

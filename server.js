@@ -101,6 +101,26 @@ function rotateElement(el, deg, cx, cy){
   }
   return el;
 }
+// ci460 新增：绕轴镜像翻转元素（axis='h' 水平翻转=绕竖直轴 x→2cx-x；axis='v' 垂直翻转=绕水平轴 y→2cy-y）。
+// 矢量：翻转每个点；文字/图片：翻转锚点(x,y)并切换 flipH/flipV 布尔供客户端镜像渲染；带 rot 的元素取负角归一化。
+function flipElement(el, axis, cx, cy){
+  if(!el || typeof el !== 'object') return el;
+  const fx = p => 2*cx - p, fy = p => 2*cy - p;
+  if(Array.isArray(el.points)){
+    for(const p of el.points){
+      if(p && typeof p === 'object' && p.x !== undefined){          // {x,y} 对象点
+        if(axis === 'h') p.x = fx(p.x||0); else p.y = fy(p.y||0);
+      } else if(Array.isArray(p)){                                  // [x,y] 数组点（与 align/distribute 同样双格式兼容）
+        if(axis === 'h') p[0] = fx(p[0]||0); else p[1] = fy(p[1]||0);
+      }
+    }
+  } else if(el.x != null || el.y != null){
+    if(axis === 'h'){ el.x = fx(el.x||0); el.flipH = !el.flipH; }
+    else { el.y = fy(el.y||0); el.flipV = !el.flipV; }
+    if(el.rot){ el.rot = ((-el.rot % 360) + 360) % 360; }   // 镜像后旋转方向反转
+  }
+  return el;
+}
 // 坐标/数值钳制：NaN/Infinity 归零，超出范围截断（防止非法坐标污染画板状态）
 function clampCoord(v, min, max){
   const n = Number(v);
@@ -280,7 +300,9 @@ function handleData(sock, buf, room){
         try{
           let obj = JSON.parse(msg);
           // 房间锁定时，非房主的编辑类操作被拒绝（仅回错误给发起者，不广播、不入栈）
-          const EDIT_OPS = new Set(['stroke','text','image','note','move','replace','clear','undo','redo','duplicate','rotate','resize','set_element_visibility','delete','pin','group','ungroup','align','comment','shape','frame','apply_template','snap_element','zswap','ztoindex','paste_style','distribute']);
+          // ci460 隐性修复：补入 'zorder'（此前漏列，房间锁定时非房主仍可经 zorder 改层级——zorder handler 自身只查 permissions/元素锁，不查 room.locked）；同时纳入新增的 'flip'
+          // ci464 隐性修复：补入 'stamp'（锁定房间非房主可放图章 + 不进录制）与 'clear_layer'（锁定房间层作者可清空整层 + 不进录制）
+          const EDIT_OPS = new Set(['stroke','text','image','note','move','replace','clear','undo','redo','duplicate','rotate','resize','set_element_visibility','delete','pin','group','ungroup','align','comment','shape','frame','apply_template','snap_element','zswap','ztoindex','paste_style','distribute','zorder','flip','stamp','clear_layer']);
           if(EDIT_OPS.has(obj.type)){
             if(room.locked && sock._cid !== room.owner){
               sendFrame(sock, JSON.stringify({ type:'error', code:'locked', msg:'房间已锁定，仅房主可编辑' }));
@@ -379,6 +401,7 @@ function handleData(sock, buf, room){
             }
             break;
           case 'stamp':   // 图章工具：在画布放置 emoji/短字符装饰（持久化、可撤销、进快照）
+            if(room.permissions && room.permissions !== 'all' && sock._cid !== room.owner){ sendFrame(sock, JSON.stringify({ type:'error', code:'no_edit_permission', msg:'当前权限下你无法编辑画板' })); break; }   // ci464: 与 stroke 一致的权限守卫（此前 host-only/view 模式可绕过）
             if(typeof obj.text !== 'string' || !obj.text.trim()) break;
             {
               const stamp = { type:'stamp', id: obj.id != null ? obj.id : (sock._cid + ':' + (++strokeSeq)),
@@ -598,7 +621,7 @@ function handleData(sock, buf, room){
               const STYLE_FIELDS = ['color','strokeWidth','fill','opacity','dash','lineCap','lineJoin','fontSize','fontFamily','fontWeight'];
               const set = new Set(ids);
               const arr = room.strokes.map(el => {
-                if(!set.has(el.id)) return el;
+                if(!el || !set.has(el.id)) return el;   // ci460 null 守卫
                 const c = JSON.parse(JSON.stringify(el));   // 深拷贝，避免共用引用污染撤销栈快照
                 for(const f of STYLE_FIELDS){ if(f in src) c[f] = JSON.parse(JSON.stringify(src[f])); }
                 return c;
@@ -630,11 +653,41 @@ function handleData(sock, buf, room){
               const cx = cnt ? sx / cnt : 0, cy = cnt ? sy / cnt : 0;
               // 深拷贝选中元素后再旋转，避免原地修改污染撤销栈快照（历史需保留旋转前状态）
               const arr = room.strokes.map(el => {
-                if(!set.has(el.id)) return el;
+                if(!el || !set.has(el.id)) return el;   // ci460 null 守卫：strokes 含 null 时不再抛 TypeError
                 const c = JSON.parse(JSON.stringify(el));
                 return rotateElement(c, deg, cx, cy);
               });
               hist.commitStrokes(room, arr);                   // 传新数组，旧状态进撤销栈
+              broadcast(room, JSON.stringify({ type:'replace', strokes: room.strokes }), sock);
+              store.saveRoom(room.name, room);
+            }
+            break;
+          case 'flip':   // ci460 新增：镜像翻转（axis:'h'|'v'，支持单 id 或 ids 批量，绕组质心镜像；rotate 仅有 90° 整数倍旋转，缺镜像能力）
+            {
+              if(room.permissions && room.permissions !== 'all' && sock._cid !== room.owner){ sendFrame(sock, JSON.stringify({ type:'error', code:'no_edit_permission', msg:'当前权限下你无法翻转元素' })); break; }
+              const axis = obj.axis;
+              if(axis !== 'h' && axis !== 'v') break;          // 仅支持水平/垂直两种轴
+              const ids = (obj.ids && Array.isArray(obj.ids)) ? obj.ids
+                        : (obj.id != null ? [obj.id] : null);
+              if(!ids || ids.length === 0) break;
+              const set = new Set(ids);
+              const sel = room.strokes.filter(el => el && set.has(el.id));
+              if(sel.length === 0) break;                      // 没命中任何 id 则忽略
+              // 组质心（与 rotate 相同算法，但兼容 {x,y}/[x,y] 双格式点）：所有选中元素锚点/points 的均值
+              const PXf = (p)=> (p && typeof p === 'object' && p.x !== undefined) ? p.x : (Array.isArray(p) ? (p[0]||0) : 0);
+              const PYf = (p)=> (p && typeof p === 'object' && p.y !== undefined) ? p.y : (Array.isArray(p) ? (p[1]||0) : 0);
+              let sx = 0, sy = 0, cnt = 0;
+              for(const el of sel){
+                if(Array.isArray(el.points)){ for(const p of el.points){ sx += PXf(p); sy += PYf(p); cnt++; } }
+                else { sx += (el.x||0); sy += (el.y||0); cnt++; }
+              }
+              const cx = cnt ? sx / cnt : 0, cy = cnt ? sy / cnt : 0;
+              const arr = room.strokes.map(el => {
+                if(!el || !set.has(el.id)) return el;
+                const c = JSON.parse(JSON.stringify(el));      // 深拷贝，撤销栈保留翻转前状态
+                return flipElement(c, axis, cx, cy);
+              });
+              hist.commitStrokes(room, arr);
               broadcast(room, JSON.stringify({ type:'replace', strokes: room.strokes }), sock);
               store.saveRoom(room.name, room);
             }
@@ -655,7 +708,7 @@ function handleData(sock, buf, room){
               if(sel.length === 0) break;                            // 没命中任何 id 则忽略
               // 深拷贝选中元素后再改 w/h，避免原地修改污染撤销栈快照（历史需保留缩放前状态）
               const arr = room.strokes.map(el => {
-                if(!set.has(el.id)) return el;
+                if(!el || !set.has(el.id)) return el;   // ci460 null 守卫
                 const c = JSON.parse(JSON.stringify(el));
                 c.w = w; c.h = h;
                 return c;
@@ -1589,7 +1642,8 @@ function handleData(sock, buf, room){
               const v = room.versions.find(x => x.id === id);
               if(!v){ sendFrame(sock, JSON.stringify({ type:'error', code:'no_version', msg:'版本不存在' })); break; }
               // R2 隐性修复(ci396)：恢复时深拷贝，避免后续原地编辑继续污染 stored 版本对象
-              room.strokes = Array.isArray(v.strokes) ? JSON.parse(JSON.stringify(v.strokes)) : room.strokes;
+              // ci464 隐性修复：恢复版本经 commitStrokes 进撤销栈——此前直接赋值 room.strokes，恢复后 Ctrl+Z 弹回加载前的编辑状态、静默吞掉刚恢复的版本
+              if(Array.isArray(v.strokes)) hist.commitStrokes(room, JSON.parse(JSON.stringify(v.strokes)));
               room.chats = Array.isArray(v.chats) ? JSON.parse(JSON.stringify(v.chats)) : room.chats;
               if(typeof v.title === 'string') room.title = v.title;
               if(typeof v.bg === 'string') room.bg = v.bg;
