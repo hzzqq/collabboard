@@ -2,6 +2,7 @@
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>CollabBoard · 实时协作白板</title>
 <style>
   :root{ --bg:#0a0c10; --panel:#12161d; --line:#1f2730; --txt:#cdd6e0; --accent:#f78c6c; }
@@ -34,11 +35,17 @@
   .val{float:right;color:var(--accent);}
   #stage{flex:1;position:relative;}
   canvas{display:block;background:#0e1118;cursor:crosshair;}
-  #cv{position:absolute;inset:0;width:100%;height:100%;}
-  #overlay{position:absolute;inset:0;width:100%;height:100%;pointer-events:none;}
+#cv{position:absolute;inset:0;width:100%;height:100%;touch-action:none;}
+#overlay{position:absolute;inset:0;width:100%;height:100%;pointer-events:none !important;touch-action:none;}
   #status{position:absolute;left:14px;top:12px;font-size:12px;z-index:5;
     background:rgba(10,12,16,.6);padding:6px 10px;border:1px solid var(--line);border-radius:8px;}
   #status b{color:var(--accent);}
+  #reconnectBar{display:none;position:absolute;left:50%;top:44px;transform:translateX(-50%);z-index:6;
+    background:#3a0d12;border:1px solid #ff5370;border-radius:8px;padding:8px 14px;align-items:center;gap:10px;
+    font-size:12px;color:#ff8a9b;box-shadow:0 2px 12px rgba(0,0,0,.5);}
+  #reconnectBar.show{display:flex;}
+  #reconnectBar button{padding:4px 10px;font-size:12px;background:#2a0a0e;border-color:#ff5370;color:#ff8a9b;}
+  #reconnectBar button:hover{background:#3a0d12;color:#fff;}
   .hint{font-size:11px;color:#6b7888;line-height:1.6;margin-top:14px;border-top:1px solid var(--line);padding-top:12px;}
   code{color:#9fb0c0;}
   #chatPanel{width:240px;background:var(--panel);border-left:1px solid var(--line);display:flex;flex-direction:column;}
@@ -60,6 +67,43 @@
   .rroom .rn{color:var(--accent);font-weight:600;}
   .rroom .rc{color:#6b7888;font-size:11px;}
 </style>
+<script>
+(function(){
+  function escapeHtml(s){ return String(s==null?'':s).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];}); }
+  function showErr(msg, detail){
+    var bar = document.getElementById('wb_err_bar');
+    if(!bar){
+      bar = document.createElement('div');
+      bar.id = 'wb_err_bar';
+      bar.style.cssText='position:fixed;top:0;left:0;right:0;z-index:2147483647;background:#3a0d12;color:#ff8a9b;font:13px/1.6 ui-monospace,Menlo,Consolas,monospace;padding:10px 16px;border-bottom:1px solid #ff5370;white-space:pre-wrap;box-shadow:0 2px 12px rgba(0,0,0,.5);display:flex;flex-wrap:wrap;gap:10px;align-items:center;';
+      (document.body||document.documentElement).appendChild(bar);
+      bar.addEventListener('click', function(e){
+        var act = e.target && e.target.dataset && e.target.dataset.act;
+        if(act==='close'){ bar.style.display='none'; }
+        else if(act==='detail'){ var d=document.getElementById('wb_err_detail'); if(d) d.style.display=(d.style.display==='none'?'block':'none'); }
+      });
+    }
+    var hint = (detail && /加载失败|three|module/i.test(detail||msg)) ? '\n（资源/模块加载失败：请检查网络或刷新页面）' : '';
+    bar.innerHTML = '<span style="flex:1;min-width:220px">⚠ 运行异常：'+escapeHtml(msg)+escapeHtml(hint)+'</span>'+
+      '<button data-act="detail" style="background:#5a1420;color:#ffb3c0;border:1px solid #ff5370;border-radius:6px;padding:4px 10px;cursor:pointer;font:12px monospace;">详情</button>'+
+      '<button data-act="close" style="background:transparent;color:#ff8a9b;border:1px solid #ff5370;border-radius:6px;padding:4px 10px;cursor:pointer;font:12px monospace;" title="关闭">×</button>'+
+      (detail ? '<pre id="wb_err_detail" style="display:none;flex-basis:100%;margin:6px 0 0;padding:8px;background:#2a0a0e;border:1px solid #ff5370;border-radius:6px;white-space:pre-wrap;max-height:200px;overflow:auto;">'+escapeHtml(detail)+'</pre>' : '');
+    bar.style.display='flex';
+    clearTimeout(bar._t); bar._t=setTimeout(function(){ bar.style.display='none'; }, 8000);
+  }
+  window.addEventListener('error', function(e){
+    var m = (e && e.message) ? e.message
+      : (e && e.target && (e.target.src||e.target.href)) ? ('资源加载失败：'+(e.target.src||e.target.href))
+      : '未知错误';
+    var d = (e && e.error && e.error.stack) ? e.error.stack : ((e && e.target && (e.target.src||e.target.href)) ? (e.target.src||e.target.href) : '');
+    showErr(m, d);
+  }, true);
+  window.addEventListener('unhandledrejection', function(e){
+    var r = (e && e.reason) || {};
+    showErr((r && r.message) ? r.message : (r || '未处理的异步异常'), r && r.stack);
+  });
+})();
+</script>
 </head>
 <body>
 <div id="app">
@@ -214,6 +258,7 @@
   </div>
   <div id="stage">
     <div id="status">房间 <b id="roomName">main</b> · 连接 <b id="conn">未连接</b> · 在线 <b id="online">1</b></div>
+    <div id="reconnectBar"><span id="reconnectMsg">连接已断开，正在重连…</span><button id="reconnectNow">立即重连</button></div>
     <canvas id="cv"></canvas>
     <canvas id="overlay"></canvas>
   </div>
@@ -546,10 +591,24 @@ function clearSelect(){ selectedIds = new Set(); redraw(); updateLockUI(); }
 // ---------- 指针交互 ----------
 let drawing = false, current = null, tool = 'pen', color = '#f78c6c', width = 4, fill = false, snOn = false, gridSize = 20;
 let dragging = false, dragEl = null, startX = 0, startY = 0, lastX = 0, lastY = 0;
-function pos(e){ const r = cv.getBoundingClientRect(); return { x:e.clientX-r.left, y:e.clientY-r.top, p:(typeof e.pressure==='number' ? e.pressure : 0.5) }; }
+// 屏幕坐标 → 画布逻辑坐标（唯一真相源）。
+// getBoundingClientRect() 给的是「视觉」尺寸，会被 CSS zoom 放大；而画布逻辑尺寸来自
+// stage.clientWidth（布局尺寸，不受 zoom 影响）。设置面板的「界面缩放」正是用 body.style.zoom
+// 实现的——不按 rect→逻辑 比例换算，缩放后落笔就会偏离光标（150% 时偏 1.5 倍，且右/下半边
+// 的点会算到画布外直接丢失）。缩放 100% 时 r.width === 逻辑宽度，比例恒为 1，与原写法等价。
+function pos(e){
+  const r = cv.getBoundingClientRect();
+  const lw = cv.width / dpr, lh = cv.height / dpr;
+  const sx = r.width  > 0 ? lw / r.width  : 1;
+  const sy = r.height > 0 ? lh / r.height : 1;
+  return { x:(e.clientX-r.left)*sx, y:(e.clientY-r.top)*sy, p:(typeof e.pressure==='number' ? e.pressure : 0.5) };
+}
 // 网格吸附：开启时把指针坐标吸附到 gridSize 整数倍；返回 {x,y,p} 与原结构兼容
 function snapP(p){ return (typeof snapPoint === 'function' && snOn) ? (()=>{ const q = snapPoint(p.x, p.y, gridSize); return { x:q[0], y:q[1], p:p.p }; })() : p; }
-cv.addEventListener('pointerdown', e=>{
+function onPointerDown(e){
+  if(e.button && e.button !== 0) return; // 仅响应左键/主指针
+  const t = e.target && e.target.id;
+  if(t !== 'cv' && t !== 'overlay' && t !== 'stage') return; // 仅响应画布区域事件
   const p = pos(e);
   if(tool === 'pin'){
     const pin = { type:'pin', id: myId + ':' + (++localSeq), x: p.x, y: p.y, label: '', author: myId, authorColor: myColor };
@@ -584,7 +643,9 @@ cv.addEventListener('pointerdown', e=>{
     return;
   }
   if(tool === 'marquee'){
-    marquee = { x0:p.x, y0:p.y, x1:p.x, y1:p.y }; marqueeing = true; cv.setPointerCapture(e.pointerId); return;
+    marquee = { x0:p.x, y0:p.y, x1:p.x, y1:p.y }; marqueeing = true;
+    if(e.pointerId != null) try { cv.setPointerCapture(e.pointerId); } catch(_){ }
+    return;
   }
   if(tool === 'select'){
     const hit = hitTest(p.x, p.y);
@@ -594,15 +655,17 @@ cv.addEventListener('pointerdown', e=>{
       if(e.shiftKey){ for(const id of base) selectedIds.add(id); }
       else selectedIds = new Set(base);
       dragGroup = [...selectedIds]; dragEl = hit;
-      dragging = true; startX = lastX = p.x; startY = lastY = p.y; cv.setPointerCapture(e.pointerId);
+      dragging = true; startX = lastX = p.x; startY = lastY = p.y;
+      if(e.pointerId != null) try { cv.setPointerCapture(e.pointerId); } catch(_){ }
     } else if(!e.shiftKey){ selectedIds = new Set(); dragEl = null; dragGroup = null; }   // 空白点击清空选择
     redraw(); return;
   }
-  drawing = true; cv.setPointerCapture(e.pointerId);
+  drawing = true;
+  if(e.pointerId != null) try { cv.setPointerCapture(e.pointerId); } catch(_){ }
   current = { tool, color, width, erase: tool==='eraser', fill, points:[snapP(p)] };
   if(tool==='line'||tool==='rect'||tool==='ellipse'||tool==='arrow') current.points.push(p);
-});
-cv.addEventListener('pointermove', e=>{
+}
+function onPointerMove(e){
   // 广播光标
   if(ws && ws.readyState===1){
     const p = pos(e);
@@ -632,8 +695,8 @@ cv.addEventListener('pointermove', e=>{
   if(tool==='pen'||tool==='eraser') current.points.push(p2);
   else current.points[1] = p2;
   redraw();
-});
-cv.addEventListener('pointerup', ()=>{
+}
+function onPointerUp(e){
   if(tool === 'laser'){ remoteLasers.delete(myId); send({ type:'laser_end' }); drawCursors(); return; }
   if(marqueeing && marquee){
     marqueeing = false;
@@ -675,7 +738,49 @@ cv.addEventListener('pointerup', ()=>{
     }
   }
   current = null; redraw();
-});
+}
+/* @pointer-binding:start  —— 这段被 _ci465_pointer_binding_test.js 直接抽出来跑回归，勿删标记 */
+// 事件绑定：stage 捕获阶段 + window up/cancel 备份，防止 cv/overlay 层叠或指针滑出画布丢失事件。
+// 只跟踪「主指针」：多点触控时不会两根手指同时驱动同一笔。
+let activePtrId = null;
+function ptrId(e){ return e.pointerId != null ? e.pointerId : (e.touchId != null ? e.touchId : 0); }
+function inCanvasArea(e){ const t = e.target && e.target.id; return t === 'cv' || t === 'overlay' || t === 'stage'; }
+function wrapDown(fn){ return function(e){
+  if(e.button && e.button !== 0) return;   // 仅响应左键/主指针
+  if(!inCanvasArea(e)) return;             // 仅响应画布区域，避免状态条/重连条上误触发
+  // 后按下者接管：即使上一次 up 事件丢失也不会把画布永久锁死
+  activePtrId = ptrId(e);
+  // 注意：pointerId 可能是 0（Firefox 鼠标），不能用真值判断，否则拖出画布就丢事件
+  if(e.pointerId != null){ try{ cv.setPointerCapture(activePtrId); }catch(_){} }
+  fn(e);
+}; }
+function wrapMove(fn){ return function(e){
+  if(activePtrId === null){
+    // 未按下的悬停移动也要转发：他人光标同步、激光笔跟手都依赖它
+    if(!inCanvasArea(e)) return;
+  } else if(ptrId(e) !== activePtrId) return;   // 按下中只认主指针
+  fn(e);
+}; }
+function wrapUp(fn){ return function(e){
+  if(activePtrId === null || ptrId(e) !== activePtrId) return;
+  activePtrId = null; fn(e);
+}; }
+
+if(window.PointerEvent){
+  stage.addEventListener('pointerdown', wrapDown(onPointerDown), true);
+  stage.addEventListener('pointermove', wrapMove(onPointerMove), true);
+  window.addEventListener('pointerup', wrapUp(onPointerUp), true);
+  window.addEventListener('pointercancel', wrapUp(onPointerUp), true);
+} else {
+  stage.addEventListener('mousedown', wrapDown(onPointerDown));
+  stage.addEventListener('mousemove', wrapMove(onPointerMove));
+  window.addEventListener('mouseup', wrapUp(onPointerUp));
+  stage.addEventListener('touchstart', e=>{ if(e.touches.length===1){ const t=e.touches[0]; e.preventDefault(); wrapDown(onPointerDown)({clientX:t.clientX,clientY:t.clientY,button:0,shiftKey:e.shiftKey,pointerId:(t.identifier||0)+1000,touchId:(t.identifier||0)+1000,target:e.target}); } }, {passive:false});
+  stage.addEventListener('touchmove', e=>{ if(e.touches.length===1){ const t=e.touches[0]; e.preventDefault(); wrapMove(onPointerMove)({clientX:t.clientX,clientY:t.clientY,pointerId:(t.identifier||0)+1000,touchId:(t.identifier||0)+1000,target:e.target}); } }, {passive:false});
+  window.addEventListener('touchend', e=>{ if(e.changedTouches.length===1){ const t=e.changedTouches[0]; wrapUp(onPointerUp)({pointerId:(t.identifier||0)+1000,touchId:(t.identifier||0)+1000,target:e.target}); } });
+  window.addEventListener('touchcancel', e=>{ if(e.changedTouches.length===1){ const t=e.changedTouches[0]; wrapUp(onPointerUp)({pointerId:(t.identifier||0)+1000,touchId:(t.identifier||0)+1000,target:e.target}); } });
+}
+/* @pointer-binding:end */
 
 // 双击编辑已有文字（非绘制工具下）：找到命中的文字元素，原地改字（按 id 发给服务端）
 cv.addEventListener('dblclick', e=>{
@@ -884,15 +989,28 @@ function send(obj){ if(ws && ws.readyState===1) ws.send(JSON.stringify(obj)); }
 function scheduleReconnect(){
   if(manualLeave) return;
   $('conn').textContent = '重连中…';
+  const bar = $('reconnectBar'), msg = $('reconnectMsg');
+  if(bar){ bar.classList.add('show'); }
+  let left = Math.ceil(reconnectDelay / 1000);
+  if(msg) msg.textContent = '连接已断开，' + left + ' 秒后重连…';
+  if(bar && bar._countdown) clearInterval(bar._countdown);
+  if(bar) bar._countdown = setInterval(()=>{
+    left--;
+    if(msg) msg.textContent = '连接已断开，' + Math.max(0, left) + ' 秒后重连…';
+    if(left <= 0) clearInterval(bar._countdown);
+  }, 1000);
   clearTimeout(reconnectTimer);
   reconnectTimer = setTimeout(()=>{ reconnectDelay = Math.min(reconnectDelay * 2, 8000); connect(); }, reconnectDelay);
 }
 function connect(){
+  const bar = $('reconnectBar');
+  if(bar){ bar.classList.remove('show'); if(bar._countdown){ clearInterval(bar._countdown); bar._countdown=null; } }
   const room = new URLSearchParams(location.search).get('room') || 'main';
   $('roomName').textContent = room;
   manualLeave = false;
   try{
-    ws = new WebSocket('ws://' + (location.hostname || 'localhost') + ':8080/?room=' + encodeURIComponent(room));
+    const wsPort = location.port || (location.protocol === 'https:' ? '443' : '80');
+    ws = new WebSocket('ws://' + (location.hostname || 'localhost') + ':' + wsPort + '/?room=' + encodeURIComponent(room));
   }catch(e){ scheduleReconnect(); return; }
   ws.onopen = ()=>{ $('conn').textContent='已连接'; reconnectDelay = 1500; send({type:'set_name', name: myName}); send({type:'cursor', id:myId, color:myColor, x:-99, y:-99}); };
   ws.onclose = ()=>{ if(manualLeave){ $('conn').textContent='已离开'; } else { scheduleReconnect(); } };
@@ -1034,8 +1152,11 @@ $('transferBtn').onclick = ()=>{
   const toId = (typeof prompt === 'function') ? prompt('输入要转让房主的用户 ID：') : null;
   if(toId && toId.trim()) send({ type:'transfer', toId: toId.trim() });
 };
+$('reconnectNow').onclick = ()=>{ reconnectDelay = 500; clearTimeout(reconnectTimer); connect(); };
 connect();
 resize();
 </script>
+<script src="./help.js"></script>
+<script src="./settings.js"></script>
 </body>
 </html>

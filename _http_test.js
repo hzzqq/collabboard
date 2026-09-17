@@ -59,8 +59,8 @@ function wsSend(s, obj){
     const root = await httpGet('/api');
     ok('root 列出端点', root.ok === true && Array.isArray(root.endpoints) && root.endpoints.includes('/api/room?name=NAME'));
 
-    const nf = await httpGet('/no-such');
-    ok('未知路径 404(ok=false)', nf.ok === false);
+    const nf = await httpGet('/api/no-such');
+    ok('未知 API 路径 404(ok=false)', nf.ok === false);
 
     // 推一笔笔画到专用房间，再经 HTTP 回查
     const ws = await wsConnect('httpRoomX');

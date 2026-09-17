@@ -6,7 +6,7 @@ let pass = 0, fail = 0;
 const ok = (n, c) => { if(c) pass++; else { fail++; console.log('  FAIL', n); } };
 process.env.PORT = '8166';
 const PORT = 8166;
-const NODE = 'C:/Users/Administrator/.workbuddy/binaries/node/versions/22.22.2/node.exe';
+const NODE = process.execPath;
 const framesOf = (s, type, pred) =>
   parseFrames(s.buf).filter(m => m && m.type === type && (!pred || pred(m)));
 

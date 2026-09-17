@@ -4,3 +4,7 @@ node_modules/
 .env
 # 白板房间持久化数据（运行时生成）
 rooms/
+# 测试临时产物：各 _*_test.js 会把 index.html 的内联脚本抽成临时文件再校验
+.wb_*_inline.js
+_inline_*.js
+.chk_*

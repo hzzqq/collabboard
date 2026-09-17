@@ -7,7 +7,7 @@ const net = require('net');
 const crypto = require('crypto');
 const path = require('path');
 
-const NODE = 'C:/Users/Administrator/.workbuddy/binaries/node/versions/22.22.2/node.exe';
+const NODE = process.execPath;
 const PORT = 8099;
 const ROOM = 'ci432_sanitize_room';
 

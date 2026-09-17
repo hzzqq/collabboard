@@ -246,30 +246,81 @@ function notifyHistory(room){
   broadcast(room, JSON.stringify({ type:'history_change', canUndo: room.undoStack.length > 0, canRedo: room.redoStack.length > 0 }));
 }
 
-// ---- 极简 HTTP 管理 API（非 WS 的 GET 请求走这里）----
+// ---- 静态文件 + HTTP 管理 API（非 WS 的 GET 请求走这里）----
+const MIME = {
+  '.html':'text/html; charset=utf-8', '.js':'application/javascript; charset=utf-8',
+  '.css':'text/css; charset=utf-8', '.json':'application/json; charset=utf-8',
+  '.svg':'image/svg+xml', '.png':'image/png', '.jpg':'image/jpeg', '.jpeg':'image/jpeg',
+  '.gif':'image/gif', '.ico':'image/x-icon', '.woff2':'font/woff2', '.woff':'font/woff',
+  '.ttf':'font/ttf', '.eot':'application/vnd.ms-fontobject', '.wasm':'application/wasm'
+};
+function staticPath(urlPath){
+  // 只允许当前目录内的静态资源，禁止 ../ 穿越
+  const safe = decodeURIComponent(urlPath).replace(/^\/+/,'').replace(/\\/g,'/');
+  if(safe.includes('..')) return null;
+  const target = path.resolve(__dirname, safe || 'index.html');
+  const root = path.resolve(__dirname);
+  if(!target.startsWith(root)) return null;
+  return target;
+}
+function serveStatic(target, sock){
+  fs.readFile(target, function(err, data){
+    if(err){
+      const body = Buffer.from('404 Not Found');
+      sock.write('HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: '+body.length+'\r\nConnection: close\r\n\r\n');
+      sock.end(body);
+      return;
+    }
+    const ext = path.extname(target).toLowerCase();
+    const ct = MIME[ext] || 'application/octet-stream';
+    sock.write('HTTP/1.1 200 OK\r\nContent-Type: '+ct+'\r\nContent-Length: '+data.length+'\r\nConnection: close\r\n\r\n');
+    sock.end(data);
+  });
+}
 function httpServe(head, sock){
   const reqLine = head.match(/^GET\s+(\S+)/);
-  const path = reqLine ? reqLine[1].split('?')[0] : '/';
+  const urlPath = reqLine ? reqLine[1].split('?')[0] : '/';
   const u = reqLine ? new URL(reqLine[1], 'http://x') : new URL('http://x/');
-  let body;
-  if(path === '/api/health'){
-    body = { ok:true, rooms:[...rooms.keys()], ts:Date.now() };
-  } else if(path === '/api/rooms'){
+  if(urlPath === '/api/health'){
+    const payload = JSON.stringify({ ok:true, rooms:[...rooms.keys()], ts:Date.now() });
+    sock.write('HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: '
+      + Buffer.byteLength(payload) + '\r\nConnection: close\r\n\r\n' + payload);
+    sock.end();
+  } else if(urlPath === '/api/rooms'){
     const counts = {}; for(const [k,r] of rooms) counts[k] = r.strokes.length;
-    body = { ok:true, rooms:[...rooms.keys()], counts };
-  } else if(path === '/api/room'){
+    const payload = JSON.stringify({ ok:true, rooms:[...rooms.keys()], counts });
+    sock.write('HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: '
+      + Buffer.byteLength(payload) + '\r\nConnection: close\r\n\r\n' + payload);
+    sock.end();
+  } else if(urlPath === '/api/room'){
     const name = u.searchParams.get('name') || 'main';
     const r = getRoom(name);
-    body = { ok:true, name, strokes:r.strokes, chats:r.chats };
-  } else if(path === '/' || path === '/api'){
-    body = { ok:true, service:'CollabBoard', endpoints:['/api/health','/api/rooms','/api/room?name=NAME'] };
+    const payload = JSON.stringify({ ok:true, name, strokes:r.strokes, chats:r.chats });
+    sock.write('HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: '
+      + Buffer.byteLength(payload) + '\r\nConnection: close\r\n\r\n' + payload);
+    sock.end();
+  } else if(urlPath === '/api'){
+    const payload = JSON.stringify({ ok:true, service:'CollabBoard', endpoints:['/api/health','/api/rooms','/api/room?name=NAME'] });
+    sock.write('HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: '
+      + Buffer.byteLength(payload) + '\r\nConnection: close\r\n\r\n' + payload);
+    sock.end();
   } else {
-    body = { ok:false, error:'not found' };
+    // API 未知路径优先返回 JSON 404（与其他 /api/* 端点一致），避免被 staticPath 当作静态资源而返回文本 404
+    if(urlPath.startsWith('/api/')) {
+      const payload = JSON.stringify({ ok:false, error:'Not Found', path:urlPath });
+      sock.write('HTTP/1.1 404 Not Found\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: '
+        + Buffer.byteLength(payload) + '\r\nConnection: close\r\n\r\n' + payload);
+      sock.end();
+    } else {
+      const target = staticPath(urlPath === '/' ? '/index.html' : urlPath);
+      if(target) serveStatic(target, sock);
+      else {
+        const body = Buffer.from('404 Not Found');
+        sock.write('HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: '+body.length+'\r\nConnection: close\r\n\r\n');
+        sock.end(body);
+      }
+    }
   }
-  const payload = JSON.stringify(body);
-  sock.write('HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: '
-    + Buffer.byteLength(payload) + '\r\nConnection: close\r\n\r\n' + payload);
-  sock.end();
 }
 
 function handleData(sock, buf, room){

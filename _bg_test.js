@@ -6,7 +6,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const { execSync } = require('child_process');
-const NODE = 'C:/Users/Administrator/.workbuddy/binaries/node/versions/22.22.2/node.exe';
+const NODE = process.execPath;
 
 const dir = __dirname;
 try { fs.rmSync(path.join(dir, 'rooms'), { recursive: true, force: true }); } catch(e){}
@@ -16,7 +16,7 @@ const ok = (n, c)=> c ? pass++ : (fail++, console.log('  FAIL', n));
 
 // 1) 内联脚本语法检查
 const html = fs.readFileSync(path.join(dir, 'index.html'), 'utf8');
-const sc = html.match(/<script>([\s\S]*?)<\/script>/);
+const sc = [...html.matchAll(/<script(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/g)].sort((a, b) => b[1].length - a[1].length)[0];
 ok('index.html 含内联脚本', !!sc);
 if(sc){
   const tmp = path.join(dir, '.wb_bg_inline.js');

@@ -2,7 +2,7 @@ const PORT = process.env.PORT ? parseInt(process.env.PORT,10) : 8098;
 // CollabBoard 迟到者状态同步测试：已锁定元素在迟到者加入时通过 join 阶段下发的 lock_element 帧补齐
 const net=require('net'), crypto=require('crypto'), fs=require('fs'), path=require('path');
 const { spawn }=require('child_process');
-const NODE='C:/Users/Administrator/.workbuddy/binaries/node/versions/22.22.2/node.exe';
+const NODE=process.execPath;
 const dir=__dirname;
 const ROOM='latejoin_'+crypto.randomBytes(3).toString('hex');
 let pass=0,fail=0; const ok=(n,c)=> c?pass++:(fail++,console.log('  FAIL',n));

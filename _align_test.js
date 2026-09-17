@@ -6,14 +6,14 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const { execSync } = require('child_process');
-const NODE = 'C:/Users/Administrator/.workbuddy/binaries/node/versions/22.22.2/node.exe';
+const NODE = process.execPath;
 const dir = __dirname;
 let fail = 0, pass = 0;
 const ok = (n, c)=> c ? pass++ : (fail++, console.log('  FAIL', n));
 function sleep(ms){ return new Promise(r=> setTimeout(r, ms)); }
 
 const html = fs.readFileSync(path.join(dir, 'index.html'), 'utf8');
-const m = html.match(/<script>([\s\S]*?)<\/script>/);
+const m = [...html.matchAll(/<script(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/g)].sort((a, b) => b[1].length - a[1].length)[0];
 ok('index.html 含内联脚本', !!m);
 if(m){ const tmp = path.join(dir, '.wb_aln_inline.js'); fs.writeFileSync(tmp, m[1]);
   try { execSync(`"${NODE}" --check "${tmp}"`); ok('内联脚本语法 OK', true); }
