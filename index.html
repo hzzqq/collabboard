@@ -118,6 +118,8 @@
       <div style="display:flex;gap:6px;">
         <input type="text" id="name" placeholder="你的昵称" maxlength="24" />
         <button id="setName">设置</button>
+        <input type="color" id="nickColor" value="#f78c6c" title="自定义昵称/光标颜色"
+               style="width:34px;height:34px;padding:0;border:1px solid var(--line);border-radius:6px;background:transparent;cursor:pointer;" />
       </div>
     </div>
     <div class="row">
@@ -921,13 +923,14 @@ function showReaction(emoji, name, color){
   setTimeout(()=>{ el.classList.add('fade'); }, 900);
   setTimeout(()=>{ if(el.parentNode) el.parentNode.removeChild(el); }, 1600);
 }
-function renderRoster(names){
+function renderRoster(names, colors){
   const r = $('roster'); r.innerHTML = '';
   $('online').textContent = names.length;
   $('online2').textContent = names.length;
-  for(const n of names){
+  for(let i = 0; i < names.length; i++){
     const s = document.createElement('span');
-    s.textContent = (n === myName ? n + '(我)' : n);
+    s.textContent = (names[i] === myName ? names[i] + '(我)' : names[i]);
+    if(Array.isArray(colors) && colors[i]) s.style.color = colors[i];   // 名单按各自自定义色着色
     r.appendChild(s);
   }
 }
@@ -957,6 +960,16 @@ function setName(){
 }
 $('setName').onclick = setName;
 $('name').addEventListener('keydown', e=>{ if(e.key==='Enter') setName(); });
+// ---------- 自定义昵称/光标颜色（ci423 服务端已有完整处理，此处补齐客户端入口/回显/持久化） ----------
+const NICKCOLOR_KEY = 'cboard_nickcolor';
+function applyNickColor(c){ myColor = c; const inp = $('nickColor'); if(inp) inp.value = c; }
+$('nickColor').onchange = e=>{
+  const c = (e.target.value || '').toLowerCase();
+  if(!/^#[0-9a-f]{6}$/.test(c)) return;              // input[type=color] 正常只产 #rrggbb，防御非预期值
+  applyNickColor(c);
+  try{ localStorage.setItem(NICKCOLOR_KEY, c); }catch(_){ }
+  send({ type:'set_nickname_color', color: c });
+};
 function sendChat(){
   const t = $('chatText').value.trim();
   if(!t) return;
@@ -1051,8 +1064,17 @@ function connect(){
       }
       case 'clear':
         strokes=[]; history=[[]]; hptr=0; redraw(); break;
-      case 'welcome':
-        myId = m.id; myColor = m.color; break;
+      case 'welcome': {
+        myId = m.id; myColor = m.color;
+        // 本地保存过自定义颜色 → 重连/进房后自动恢复（服务端调色板分配会被覆盖）
+        let saved = null; try{ saved = localStorage.getItem(NICKCOLOR_KEY); }catch(_){ }
+        if(saved && /^#[0-9a-f]{6}$/.test(saved)){ applyNickColor(saved); send({ type:'set_nickname_color', color: saved }); }
+        break;
+      }
+      case 'nickname_color':   // 他人（或自己）改色广播：更新光标配色
+        if(m.id === myId){ myColor = m.color; }
+        else { const rc = remoteCursors.get(m.id); if(rc){ rc.color = m.color; drawCursors(); } }
+        break;
       case 'snapshot':
         strokes = clone(m.strokes||[]); history=[clone(strokes)]; hptr=0; redraw();
         $('chatLog').innerHTML = '';
@@ -1087,7 +1109,12 @@ function connect(){
         break;
       case 'presence':
         $('online').textContent = m.count;
-        if(Array.isArray(m.names)) renderRoster(m.names);
+        if(Array.isArray(m.names)) renderRoster(m.names, m.colors);
+        if(Array.isArray(m.ids) && Array.isArray(m.colors)){
+          const cmap = {}; for(let i = 0; i < m.ids.length; i++) cmap[m.ids[i]] = m.colors[i];
+          for(const [cid, rc] of remoteCursors) if(cmap[cid] && rc.color !== cmap[cid]){ rc.color = cmap[cid]; }
+          drawCursors();
+        }
         if(Array.isArray(m.ids)) for(const cid of [...remoteSelections.keys()]) if(!m.ids.includes(cid)) remoteSelections.delete(cid);  // 清理已离开者的选区
         break;
       case 'room_list':
