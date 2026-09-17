@@ -3,6 +3,9 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<meta name="theme-color" content="#12161d" />
+<link rel="manifest" href="manifest.webmanifest" />
+<link rel="icon" href="icon.svg" type="image/svg+xml" />
 <title>CollabBoard · 实时协作白板</title>
 <style>
   :root{ --bg:#0a0c10; --panel:#12161d; --line:#1f2730; --txt:#cdd6e0; --accent:#f78c6c; }
@@ -1158,5 +1161,15 @@ resize();
 </script>
 <script src="./help.js"></script>
 <script src="./settings.js"></script>
+<script>
+// PWA：注册 Service Worker（仅 http/https 环境尝试；file:// 或旧浏览器静默跳过）
+(function(){
+  try{
+    if('serviceWorker' in navigator && /^https?:$/.test(location.protocol)){
+      navigator.serviceWorker.register('sw.js').catch(function(){ /* 注册失败不影响使用 */ });
+    }
+  }catch(_){ }
+})();
+</script>
 </body>
 </html>

@@ -1,0 +1,25 @@
+{
+  "name": "CollabBoard 实时协作白板",
+  "short_name": "CollabBoard",
+  "description": "零依赖 WebSocket 实时协作白板：多人绘画、光标、聊天、权限管理",
+  "lang": "zh-CN",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#0a0c10",
+  "theme_color": "#12161d",
+  "icons": [
+    {
+      "src": "icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    },
+    {
+      "src": "icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "maskable"
+    }
+  ]
+}
