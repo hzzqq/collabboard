@@ -258,7 +258,7 @@
       右侧聊天栏可与同房间伙伴对话；左栏可设置<b>昵称</b>、查看<b>在线名单</b>。<br><br>
       启动：<code>node server.js</code><br>
       快捷键：<code>Ctrl+Z</code> 撤销 / <code>Ctrl+Y</code> 重做<br>
-      「选择/移动」工具可拖动已画元素（文字/图形整体平移，松手同步他人）。<b>▢ 框选</b>工具拖出矩形即可多选，选中后拖动任一元素会<b>整组移动</b>（服务端按 id 列表平移并广播）；<b>☑ 全选</b>/<b>✕ 取消选择</b>或 <code>Esc</code> 管理选区。
+      「选择/移动」工具可拖动已画元素（文字/图形整体平移，松手同步他人）。<b>▢ 框选</b>工具拖出矩形即可多选，选中后拖动任一元素会<b>整组移动</b>（服务端按 id 列表平移并广播）；<b>☑ 全选</b>/<b>✕ 取消选择</b>或 <code>Esc</code> 管理选区，<code>Del</code>/<code>Backspace</code> 删除选中（输入框内不触发）。
     </div>
   </div>
   <div id="stage">
@@ -550,6 +550,17 @@ function bboxOf(s){
   }
   return null;
 }
+// 框选命中：矩形(rx,ry,rw,rh)（调用方已归一化）与元素包围盒 AABB 相交（含贴边）即命中；
+// rw<=2 且 rh<=2 视为点击而非框选（返回空集，防误触）；无包围盒的元素（如 pin）跳过。
+function marqueePick(rx, ry, rw, rh, list){
+  const sel = new Set();
+  if(!(rw > 2 || rh > 2)) return sel;
+  for(const s of list){
+    const b = bboxOf(s); if(!b) continue;
+    if(!(rx+rw < b.x || rx > b.x+b.w || ry+rh < b.y || ry > b.y+b.h)) sel.add(s.id);
+  }
+  return sel;
+}
 // ---------- 多选 / 框选 ----------
 let selectedIds = new Set();   // 当前选中的元素 id 集合（群组移动用）
 let remoteSelections = new Map(); // cid -> { ids:[], color, name } 协作者的选区（在场显示）
@@ -707,12 +718,7 @@ function onPointerUp(e){
     marqueeing = false;
     const rx=Math.min(marquee.x0,marquee.x1), ry=Math.min(marquee.y0,marquee.y1);
     const rw=Math.abs(marquee.x1-marquee.x0), rh=Math.abs(marquee.y1-marquee.y0);
-    const sel = new Set();
-    if(rw>2 || rh>2){   // 拖出有效矩形才视为框选
-      for(const s of strokes){ const b = bboxOf(s); if(!b) continue;
-        if(!(rx+rw < b.x || rx > b.x+b.w || ry+rh < b.y || ry > b.y+b.h)) sel.add(s.id); }
-    }
-    selectedIds = sel; marquee = null; redraw(); updateLockUI(); return;
+    selectedIds = marqueePick(rx, ry, rw, rh, strokes); marquee = null; redraw(); updateLockUI(); return;
   }
   if(dragging){
     dragging = false;
@@ -892,11 +898,16 @@ $('export').onclick = ()=>{
   a.href = 'data:application/json;charset=utf-8,' + encodeURIComponent(JSON.stringify({ room: room0, strokes }));
   a.click();
 };
-window.addEventListener('keydown', e=>{
+function onKeydown(e){
   if(e.ctrlKey && (e.key==='z'||e.key==='Z') && !e.shiftKey){ e.preventDefault(); undo(); }
   else if(e.ctrlKey && (e.key==='y'||e.key==='Y' || (e.shiftKey && (e.key==='z'||e.key==='Z')))){ e.preventDefault(); redo(); }
   else if(e.key==='Escape'){ clearSelect(); }   // Esc 取消选择
-});
+  else if((e.key==='Delete'||e.key==='Backspace') && selectedIds.size){
+    const tg = e.target && e.target.tagName;     // 输入框内退格/删除是文本编辑，不删画板元素
+    if(tg !== 'INPUT' && tg !== 'TEXTAREA'){ e.preventDefault(); deleteSel(); }
+  }
+}
+window.addEventListener('keydown', onKeydown);
 
 function undo(){ send({type:'undo'}); }     // 撤销/重做改为服务端权威快照栈，跨端同步
 function redo(){ send({type:'redo'}); }
