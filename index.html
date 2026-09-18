@@ -929,6 +929,14 @@ $('export').onclick = ()=>{
 function onKeydown(e){
   if(e.ctrlKey && (e.key==='z'||e.key==='Z') && !e.shiftKey){ e.preventDefault(); undo(); }
   else if(e.ctrlKey && (e.key==='y'||e.key==='Y' || (e.shiftKey && (e.key==='z'||e.key==='Z')))){ e.preventDefault(); redo(); }
+  else if(e.ctrlKey && (e.key==='a'||e.key==='A')){            // Ctrl+A 全选（输入框内是全选文本，不劫持）
+    const tg = e.target && e.target.tagName;
+    if(tg !== 'INPUT' && tg !== 'TEXTAREA'){ e.preventDefault(); selectAll(); }
+  }
+  else if(e.ctrlKey && (e.key==='d'||e.key==='D')){            // Ctrl+D 克隆选中（duplicateSel 自带空选守卫）
+    const tg = e.target && e.target.tagName;
+    if(tg !== 'INPUT' && tg !== 'TEXTAREA'){ e.preventDefault(); duplicateSel(); }
+  }
   else if(e.key==='Escape'){ clearSelect(); }   // Esc 取消选择
   else if((e.key==='Delete'||e.key==='Backspace') && selectedIds.size){
     const tg = e.target && e.target.tagName;     // 输入框内退格/删除是文本编辑，不删画板元素
