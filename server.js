@@ -1567,7 +1567,7 @@ function handleData(sock, buf, room){
           case 'shape':   // 矢量图形基本图元：rect/ellipse/line/triangle（持久化、可撤销、受房间锁/元素锁约束）
             {
               const kind = (typeof obj.kind === 'string') ? obj.kind : '';
-              if(!['rect','ellipse','line','triangle'].includes(kind)){ sendFrame(sock, JSON.stringify({ type:'error', code:'bad_kind', msg:'shape 需要 kind: rect/ellipse/line/triangle' })); break; }
+              if(!['rect','ellipse','line','triangle','diamond'].includes(kind)){ sendFrame(sock, JSON.stringify({ type:'error', code:'bad_kind', msg:'shape 需要 kind: rect/ellipse/line/triangle/diamond' })); break; }
               const x = clampCoord(obj.x, -100000, 100000), y = clampCoord(obj.y, -100000, 100000);
               const w = Math.max(1, Math.min(20000, +obj.w||100));
               const h = Math.max(1, Math.min(20000, +obj.h||100));
@@ -1834,6 +1834,7 @@ function handleData(sock, buf, room){
                   else if(el.shapeKind === 'rect'){ svg += '<rect x="'+clampCoord(el.x,0,1e6)+'" y="'+clampCoord(el.y,0,1e6)+'" width="'+clampCoord(el.w,0,1e6)+'" height="'+clampCoord(el.h,0,1e6)+'" fill="'+(el.fill||'none')+'" stroke="'+el.color+'"/>'; }
                   else if(el.shapeKind === 'ellipse'){ svg += '<ellipse cx="'+(clampCoord(el.x,0,1e6)+clampCoord(el.w,0,1e6)/2)+'" cy="'+(clampCoord(el.y,0,1e6)+clampCoord(el.h,0,1e6)/2)+'" rx="'+(clampCoord(el.w,0,1e6)/2)+'" ry="'+(clampCoord(el.h,0,1e6)/2)+'" fill="none" stroke="'+el.color+'"/>'; }
                   else if(el.shapeKind === 'line'){ svg += '<line x1="'+clampCoord(el.x,0,1e6)+'" y1="'+clampCoord(el.y,0,1e6)+'" x2="'+clampCoord(el.x+el.w,0,1e6)+'" y2="'+clampCoord(el.y+el.h,0,1e6)+'" stroke="'+el.color+'"/>'; }
+                  else if(el.shapeKind === 'diamond'){ svg += '<polygon points="'+(el.x+el.w/2)+','+el.y+' '+(el.x+el.w)+','+(el.y+el.h/2)+' '+(el.x+el.w/2)+','+(el.y+el.h)+' '+el.x+','+(el.y+el.h/2)+'" fill="'+(el.fill||'none')+'" stroke="'+el.color+'"/>'; }
                   else if(el.shapeKind === 'triangle'){ svg += '<polygon points="'+(el.x+el.w/2)+','+el.y+' '+el.x+','+(el.y+el.h)+' '+(el.x+el.w)+','+(el.y+el.h)+'" fill="'+(el.fill||'none')+'" stroke="'+el.color+'"/>'; }
                   else if(el.type === 'text'){ svg += '<text x="'+clampCoord(el.x,0,1e6)+'" y="'+clampCoord(el.y,0,1e6)+'" fill="'+el.color+'">'+escapeXml(el.text)+'</text>'; }
                 }

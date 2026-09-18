@@ -46,6 +46,8 @@
           L.push(`<line x1="${x}" y1="${y}" x2="${x + w}" y2="${y + h}" stroke="${esc(col)}" stroke-width="${sw}"/>`);
         } else if (s.shapeKind === 'triangle') {
           L.push(`<polygon points="${x + w / 2},${y} ${x},${y + h} ${x + w},${y + h}" fill="${f}" stroke="${esc(col)}" stroke-width="${sw}"/>`);
+        } else if (s.shapeKind === 'diamond') {
+          L.push(`<polygon points="${x + w / 2},${y} ${x + w},${y + h / 2} ${x + w / 2},${y + h} ${x},${y + h / 2}" fill="${f}" stroke="${esc(col)}" stroke-width="${sw}"/>`);
         } else {
           L.push(`<rect x="${x}" y="${y}" width="${w}" height="${h}" fill="${f}" stroke="${esc(col)}" stroke-width="${sw}"/>`);
         }
