@@ -1829,8 +1829,12 @@ function handleData(sock, buf, room){
                 let svg = '<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="800">';
                 if(room.bg) svg += '<rect width="100%" height="100%" fill="'+room.bg+'"/>';
                 for(const el of room.strokes){ if(room.hiddenElements && room.hiddenElements.has(el.id)) continue;   // 隐藏元素不进入 SVG 导出
-                  if(el.type === 'frame' || el.shapeKind === 'rect' || el.shapeKind === 'triangle'){ svg += '<rect x="'+clampCoord(el.x,0,1e6)+'" y="'+clampCoord(el.y,0,1e6)+'" width="'+clampCoord(el.w,0,1e6)+'" height="'+clampCoord(el.h,0,1e6)+'" fill="'+(el.fill||'none')+'" stroke="'+el.color+'"/>'; }
+                  if(el.type === 'stamp'){ const stsz = Math.max(8, Math.min(256, +el.size||48)); svg += '<text x="'+clampCoord(el.x,0,1e6)+'" y="'+(clampCoord(el.y,0,1e6)+stsz/2)+'" fill="'+el.color+'" font-family="ui-monospace, monospace" font-size="'+stsz+'" text-anchor="middle" dominant-baseline="middle">'+escapeXml(el.text)+'</text>'; }
+                  else if(el.type === 'frame'){ svg += '<rect x="'+clampCoord(el.x,0,1e6)+'" y="'+clampCoord(el.y,0,1e6)+'" width="'+clampCoord(el.w,0,1e6)+'" height="'+clampCoord(el.h,0,1e6)+'" fill="none" stroke="'+el.color+'" stroke-dasharray="8 5"/><text x="'+(clampCoord(el.x,0,1e6)+6)+'" y="'+(clampCoord(el.y,0,1e6)-4)+'" fill="'+el.color+'" font-family="sans-serif" font-size="13">'+escapeXml(el.label)+'</text>'; }
+                  else if(el.shapeKind === 'rect'){ svg += '<rect x="'+clampCoord(el.x,0,1e6)+'" y="'+clampCoord(el.y,0,1e6)+'" width="'+clampCoord(el.w,0,1e6)+'" height="'+clampCoord(el.h,0,1e6)+'" fill="'+(el.fill||'none')+'" stroke="'+el.color+'"/>'; }
                   else if(el.shapeKind === 'ellipse'){ svg += '<ellipse cx="'+(clampCoord(el.x,0,1e6)+clampCoord(el.w,0,1e6)/2)+'" cy="'+(clampCoord(el.y,0,1e6)+clampCoord(el.h,0,1e6)/2)+'" rx="'+(clampCoord(el.w,0,1e6)/2)+'" ry="'+(clampCoord(el.h,0,1e6)/2)+'" fill="none" stroke="'+el.color+'"/>'; }
+                  else if(el.shapeKind === 'line'){ svg += '<line x1="'+clampCoord(el.x,0,1e6)+'" y1="'+clampCoord(el.y,0,1e6)+'" x2="'+clampCoord(el.x+el.w,0,1e6)+'" y2="'+clampCoord(el.y+el.h,0,1e6)+'" stroke="'+el.color+'"/>'; }
+                  else if(el.shapeKind === 'triangle'){ svg += '<polygon points="'+(el.x+el.w/2)+','+el.y+' '+el.x+','+(el.y+el.h)+' '+(el.x+el.w)+','+(el.y+el.h)+'" fill="'+(el.fill||'none')+'" stroke="'+el.color+'"/>'; }
                   else if(el.type === 'text'){ svg += '<text x="'+clampCoord(el.x,0,1e6)+'" y="'+clampCoord(el.y,0,1e6)+'" fill="'+el.color+'">'+escapeXml(el.text)+'</text>'; }
                 }
                 svg += '</svg>';

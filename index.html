@@ -360,6 +360,52 @@ function drawStroke(s){
     ctx.fillText(s.text || '', 0, 0);
     ctx.restore(); return;
   }
+  // shape API 图元（服务端持久化元素，此前客户端不可见）：rect/ellipse/line/triangle，支持填充/旋转/镜像
+  if(s.type === 'shape'){
+    const x=(s.x||0)*dpr, y=(s.y||0)*dpr, w=(s.w||0)*dpr, h=(s.h||0)*dpr;
+    const rot = (s.rot||0) * Math.PI/180;
+    ctx.lineWidth = 2*dpr;   // shape 元素无 width 字段，显式定线宽避免继承上一元素的残留值
+    if(rot){ ctx.translate(x+w/2, y+h/2); ctx.rotate(rot); ctx.translate(-(x+w/2), -(y+h/2)); }
+    if(s.flipH || s.flipV){ ctx.translate(x+w/2, y+h/2); ctx.scale(s.flipH?-1:1, s.flipV?-1:1); ctx.translate(-(x+w/2), -(y+h/2)); }
+    if(s.shapeKind === 'ellipse'){
+      ctx.beginPath(); ctx.ellipse(x+w/2, y+h/2, Math.abs(w)/2, Math.abs(h)/2, 0, 0, Math.PI*2);
+      if(s.fill){ ctx.fillStyle = s.fill; ctx.fill(); } else { ctx.strokeStyle = s.color; ctx.stroke(); }
+    } else if(s.shapeKind === 'line'){
+      ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x+w, y+h); ctx.strokeStyle = s.color; ctx.stroke();
+    } else if(s.shapeKind === 'triangle'){
+      ctx.beginPath(); ctx.moveTo(x+w/2, y); ctx.lineTo(x, y+h); ctx.lineTo(x+w, y+h); ctx.closePath();
+      if(s.fill){ ctx.fillStyle = s.fill; ctx.fill(); } else { ctx.strokeStyle = s.color; ctx.stroke(); }
+    } else {
+      if(s.fill){ ctx.fillStyle = s.fill; ctx.fillRect(x,y,w,h); } else { ctx.strokeStyle = s.color; ctx.strokeRect(x,y,w,h); }
+    }
+  }
+  // 画布分区/框：虚线边框 + 左上角标题（服务端 frame API，此前客户端不可见）
+  if(s.type === 'frame'){
+    const x=(s.x||0)*dpr, y=(s.y||0)*dpr, w=(s.w||0)*dpr, h=(s.h||0)*dpr;
+    const rot = (s.rot||0) * Math.PI/180;
+    ctx.lineWidth = 2*dpr;
+    if(rot){ ctx.translate(x+w/2, y+h/2); ctx.rotate(rot); ctx.translate(-(x+w/2), -(y+h/2)); }
+    ctx.setLineDash([8*dpr, 5*dpr]);
+    ctx.strokeStyle = s.color || '#82aaff';
+    ctx.strokeRect(x, y, w, h);
+    ctx.setLineDash([]);
+    ctx.fillStyle = s.color || '#82aaff';
+    ctx.font = (13*dpr)+'px sans-serif';
+    ctx.textBaseline = 'top';
+    ctx.fillText(s.label || '', x + 6*dpr, y - 16*dpr);
+  }
+  // 印章：大号居中文字（服务端 stamp API，此前客户端不可见），rotation 为原生角度、rot 累计自 rotate 操作
+  if(s.type === 'stamp'){
+    const rot = ((s.rotation||0) + (s.rot||0)) * Math.PI/180;
+    ctx.translate((s.x||0)*dpr, (s.y||0)*dpr);
+    if(rot) ctx.rotate(rot);
+    if(s.flipH || s.flipV) ctx.scale(s.flipH?-1:1, s.flipV?-1:1);
+    ctx.fillStyle = s.color || '#ffffff';
+    ctx.font = (Math.max(8, s.size||48)*dpr) + 'px ui-monospace, monospace';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText(s.text || '', 0, 0);
+    ctx.textAlign = 'start'; ctx.textBaseline = 'alphabetic';   // 还原，避免泄漏到后续徽标绘制
+  }
   if(s.erase) ctx.globalCompositeOperation = 'destination-out';
   ctx.beginPath();
   const p = s.points;
@@ -392,7 +438,7 @@ function drawStroke(s){
   // 评论徽标：元素带评论时在左上角画 💬n 角标
   if(s.comments && s.comments.length){
     let ax, ay;
-    if(s.type === 'text' || s.type === 'image'){ ax = s.x; ay = s.y; }
+    if(s.type === 'text' || s.type === 'image' || s.type === 'shape' || s.type === 'frame' || s.type === 'stamp'){ ax = s.x; ay = s.y; }
     else if(Array.isArray(s.points) && s.points.length){
       let mnx=Infinity, mny=Infinity;
       for(const q of s.points){ if(q.x<mnx)mnx=q.x; if(q.y<mny)mny=q.y; }
@@ -513,22 +559,16 @@ function translateLocal(el, dx, dy){
   if(!el) return;
   if(el.type === 'text'){ el.x += dx; el.y += dy; }
   else if(Array.isArray(el.points)){ for(const p of el.points){ p.x += dx; p.y += dy; } }
+  else if(el.x != null || el.y != null){ el.x = (el.x||0) + dx; el.y = (el.y||0) + dy; }   // shape/frame/stamp/image 等锚点元素（与服务端 translateElement 泛化分支一致）
 }
-// 命中测试：从顶层（数组末尾）优先，返回最上层命中的元素（含 8px 容差）
+// 命中测试：从顶层（数组末尾）优先，返回最上层命中的元素（含 8px 容差）。
+// 包围盒统一走 bboxOf（此前与 bboxOf 重复维护一套 AABB 公式，已漂移：image/shape/frame/stamp 无法点选）。
 function hitTest(x, y){
   for(let i = strokes.length - 1; i >= 0; i--){
     const s = strokes[i];
     if(!s || s.id == null) continue;
-    let bb;
-    if(s.type === 'text'){
-      const w = (s.text ? s.text.length : 1) * Math.max(10, s.width) * 0.6;
-      const h = Math.max(12, s.width) * 1.2;
-      bb = { x: s.x, y: s.y, w, h };
-    } else if(Array.isArray(s.points) && s.points.length){
-      let minx=Infinity, miny=Infinity, maxx=-Infinity, maxy=-Infinity;
-      for(const p of s.points){ if(p.x<minx)minx=p.x; if(p.y<miny)miny=p.y; if(p.x>maxx)maxx=p.x; if(p.y>maxy)maxy=p.y; }
-      bb = { x:minx, y:miny, w:maxx-minx, h:maxy-miny };
-    } else continue;
+    const bb = bboxOf(s);
+    if(!bb) continue;
     const pad = 8;
     if(x >= bb.x-pad && x <= bb.x+bb.w+pad && y >= bb.y-pad && y <= bb.y+bb.h+pad) return s;
   }
@@ -543,6 +583,8 @@ function bboxOf(s){
     return { x:s.x, y:s.y, w, h };
   }
   if(s.type === 'image'){ return { x:s.x, y:s.y, w:s.w||0, h:s.h||0 }; }
+  if(s.type === 'stamp'){ const sz = Math.max(8, s.size||48); return { x:s.x||0, y:s.y||0, w:sz, h:sz }; }
+  if(s.x != null && s.w != null){ return { x:s.x||0, y:s.y||0, w:s.w, h:s.h||0 }; }   // shape/frame/note 等锚点+尺寸元素
   if(Array.isArray(s.points) && s.points.length){
     let minx=Infinity,miny=Infinity,maxx=-Infinity,maxy=-Infinity;
     for(const p of s.points){ if(p.x<minx)minx=p.x; if(p.y<miny)miny=p.y; if(p.x>maxx)maxx=p.x; if(p.y>maxy)maxy=p.y; }
@@ -1100,6 +1142,10 @@ function connect(){
       case 'note':
         strokes.push(m); history = history.slice(0,hptr+1); history.push(clone(strokes)); hptr++; redraw(); break;
       case 'pin':
+        strokes.push(m); history = history.slice(0,hptr+1); history.push(clone(strokes)); hptr++; redraw(); break;
+      case 'shape':   // 服务端 shape API（rect/ellipse/line/triangle）：此前客户端无分派，元素广播后静默丢失
+      case 'frame':
+      case 'stamp':
         strokes.push(m); history = history.slice(0,hptr+1); history.push(clone(strokes)); hptr++; redraw(); break;
       case 'comment': {
         const el = strokes.find(s => s && s.id === m.id);

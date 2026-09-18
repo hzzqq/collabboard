@@ -1,0 +1,1 @@
+whiteboard: 幽灵图元收编——服务端 shape/frame/stamp 客户端全链路支持：WS 分派/渲染/选择/移动补齐 + 双导出路径补漏(triangle 误 rect 改 polygon) + _ghost_shapes_test 79 断言

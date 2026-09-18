@@ -36,6 +36,33 @@
       const col = s.color || '#000';
       // 橡皮擦在 SVG 无透明背景可擦除，渲染为浅灰提示笔迹（不破坏结构）
       const strokeCol = s.erase ? '#cccccc' : col;
+      // 服务端 shape API 图元（此前导出静默丢失）
+      if (s.type === 'shape') {
+        const x = s.x || 0, y = s.y || 0, w = s.w || 0, h = s.h || 0;
+        const f = esc(s.fill || 'none');
+        if (s.shapeKind === 'ellipse') {
+          L.push(`<ellipse cx="${x + w / 2}" cy="${y + h / 2}" rx="${Math.abs(w) / 2}" ry="${Math.abs(h) / 2}" fill="${f}" stroke="${esc(col)}" stroke-width="${sw}"/>`);
+        } else if (s.shapeKind === 'line') {
+          L.push(`<line x1="${x}" y1="${y}" x2="${x + w}" y2="${y + h}" stroke="${esc(col)}" stroke-width="${sw}"/>`);
+        } else if (s.shapeKind === 'triangle') {
+          L.push(`<polygon points="${x + w / 2},${y} ${x},${y + h} ${x + w},${y + h}" fill="${f}" stroke="${esc(col)}" stroke-width="${sw}"/>`);
+        } else {
+          L.push(`<rect x="${x}" y="${y}" width="${w}" height="${h}" fill="${f}" stroke="${esc(col)}" stroke-width="${sw}"/>`);
+        }
+        continue;
+      }
+      // 画布分区/框：虚线矩形 + 标题文字（此前导出静默丢失）
+      if (s.type === 'frame') {
+        L.push(`<rect x="${s.x || 0}" y="${s.y || 0}" width="${s.w || 0}" height="${s.h || 0}" fill="none" stroke="${esc(s.color || '#82aaff')}" stroke-width="${sw}" stroke-dasharray="8 5"/>`);
+        L.push(`<text x="${(s.x || 0) + 6}" y="${(s.y || 0) - 4}" fill="${esc(s.color || '#82aaff')}" font-family="sans-serif" font-size="13">${esc(s.label || '')}</text>`);
+        continue;
+      }
+      // 印章：居中大号文字（此前导出静默丢失）
+      if (s.type === 'stamp') {
+        const sz = Math.max(8, s.size || 48);
+        L.push(`<text x="${s.x || 0}" y="${(s.y || 0) + sz / 2}" fill="${esc(s.color || '#000')}" font-family="ui-monospace, monospace" font-size="${sz}" text-anchor="middle" dominant-baseline="middle">${esc(s.text)}</text>`);
+        continue;
+      }
       if (s.tool === 'pen' || s.tool === 'eraser') {
         if (!s.points || s.points.length < 1) continue;
         L.push(`<polyline points="${ptsStr(s.points)}" fill="none" stroke="${esc(strokeCol)}" stroke-width="${sw}" stroke-linecap="round" stroke-linejoin="round"/>`);
