@@ -188,10 +188,12 @@
       </div>
     </div>
     <div class="row">
-      <label>旋转（需先选中元素）</label>
+      <label>旋转 / 翻转（需先选中元素）</label>
       <div style="display:flex; gap:6px; flex-wrap:wrap;">
         <button id="rotL" style="flex:1;">⟲ 左90°</button>
         <button id="rotR" style="flex:1;">⟳ 右90°</button>
+        <button id="flipH" style="flex:1;">⇋ 水平翻转</button>
+        <button id="flipV" style="flex:1;">⇵ 垂直翻转</button>
       </div>
     </div>
     <div class="row">
@@ -943,6 +945,10 @@ $('alignB').onclick = ()=> alignSel('bottom');
 function rotateSel(deg){ if(selectedIds.size === 0) return; send({ type:'rotate', ids:[...selectedIds], deg }); }
 $('rotL').onclick = ()=> rotateSel(-90);
 $('rotR').onclick = ()=> rotateSel(90);
+// 翻转：复用服务端 flip op（ci460）+ 十五轮烘焙几何（line 反对角/triangle rot 映射/image flag）
+function flipSel(axis){ if(selectedIds.size === 0) return; send({ type:'flip', ids:[...selectedIds], axis }); }
+$('flipH').onclick = ()=> flipSel('h');
+$('flipV').onclick = ()=> flipSel('v');
 function deleteSel(){ if(selectedIds.size === 0) return; send({ type:'delete', ids:[...selectedIds] }); }
 // 方向键微移：与拖拽同一通道（本地先平移 + 一次性 move 广播，服务端进撤销栈支持 Ctrl+Z）
 function nudgeSel(dx, dy){
@@ -1013,6 +1019,10 @@ function onKeydown(e){
   else if((e.key==='Delete'||e.key==='Backspace') && selectedIds.size){
     const tg = e.target && e.target.tagName;     // 输入框内退格/删除是文本编辑，不删画板元素
     if(tg !== 'INPUT' && tg !== 'TEXTAREA'){ e.preventDefault(); deleteSel(); }
+  }
+  else if(!e.ctrlKey && !e.metaKey && (e.key==='h'||e.key==='H'||e.key==='v'||e.key==='V') && selectedIds.size){   // H/V 翻转选中（排除 Ctrl/Cmd 组合，防劫持浏览器历史/粘贴等）
+    const tg = e.target && e.target.tagName;     // 输入框内 H/V 是打字，不翻转元素
+    if(tg !== 'INPUT' && tg !== 'TEXTAREA'){ e.preventDefault(); flipSel((e.key==='h'||e.key==='H') ? 'h' : 'v'); }
   }
   else if(e.key && e.key.indexOf('Arrow') === 0 && selectedIds.size){
     const tg = e.target && e.target.tagName;     // 输入框内方向键是光标移动，不微移元素
