@@ -84,7 +84,10 @@ function translateElement(el, dx, dy){
   return el;
 }
 // 绕质心 (cx,cy) 将元素旋转 deg 度（仅 90° 整数倍，原地修改并返回）。
-// 矢量：旋转每个点；文字/图片：旋转锚点(x,y)并累计 rot 字段供客户端渲染。
+// 矢量：旋转每个点；{x,y,w,h} 系（shape/frame/note/image）：AABB 烘焙——盒中心绕质心公转 + 90/270 交换 w/h，
+// 旋转语义进元素本体（rect/ellipse/diamond/frame/note 90° 自对称烘焙后即最终几何；line 记 anti 对角线方向；
+// triangle/image 内容非自对称，累计 rot 供渲染端取变体）；点锚元素（text/stamp/pin）：旋转锚点并累计 rot。
+// 旧版仅搬锚点：90° 不交换 w/h 且锚点≠盒中心，多选时元素错位、框选/对齐包围盒全错。
 function rotateElement(el, deg, cx, cy){
   if(!el || typeof el !== 'object') return el;
   const rad = (deg % 360) * Math.PI / 180;
@@ -95,6 +98,20 @@ function rotateElement(el, deg, cx, cy){
   };
   if(Array.isArray(el.points)){
     for(const p of el.points){ const [nx, ny] = rot(p.x||0, p.y||0); p.x = nx; p.y = ny; }
+  } else if(el.w != null && el.h != null){
+    // AABB 烘焙：盒中心绕质心公转，重算包围盒（90/270 交换 w/h，坐标取整数避免浮点残渣）
+    const [ncx, ncy] = rot((el.x||0) + el.w/2, (el.y||0) + el.h/2);
+    const swap = (deg % 180 !== 0);
+    const nw = swap ? el.h : el.w, nh = swap ? el.w : el.h;
+    el.x = Math.round(ncx - nw/2); el.y = Math.round(ncy - nh/2);
+    el.w = nw; el.h = nh;
+    if(el.type === 'shape' && el.shapeKind === 'line'){
+      if(deg % 180 !== 0) el.anti = !el.anti;          // 主对角线 ↔ 反对角线（180° 不变）
+    } else if(el.type === 'shape' && el.shapeKind === 'triangle'){
+      el.rot = ((el.rot||0) + deg) % 360;               // 顶点朝向随内容旋转（渲染端按 rot 取变体）
+    } else if(el.type === 'image'){
+      el.rot = ((el.rot||0) + deg) % 360;               // 位图内容旋转
+    }
   } else if(el.x != null || el.y != null){
     const [nx, ny] = rot(el.x||0, el.y||0); el.x = nx; el.y = ny;
     el.rot = ((el.rot||0) + deg) % 360;
@@ -102,7 +119,10 @@ function rotateElement(el, deg, cx, cy){
   return el;
 }
 // ci460 新增：绕轴镜像翻转元素（axis='h' 水平翻转=绕竖直轴 x→2cx-x；axis='v' 垂直翻转=绕水平轴 y→2cy-y）。
-// 矢量：翻转每个点；文字/图片：翻转锚点(x,y)并切换 flipH/flipV 布尔供客户端镜像渲染；带 rot 的元素取负角归一化。
+// {x,y,w,h} 系：AABB 烘焙——整盒镜像 x'=2cx-x-w（旧实现 x'=2cx-x 漏减 w，多选翻转时整组横向错位 w），
+// 镜像语义进元素本体（rect/ellipse/diamond/frame/note 镜像自对称；line 主↔反对角互换；triangle 顶点朝向
+// 按旋转群映射（等腰三角形镜像=纯旋转，无 flag）；image 内容镜像记 flipH/flipV）；
+// 点锚元素（text/stamp/pin）：翻转锚点并切换 flipH/flipV；带 rot 的点锚元素取负角归一化。
 function flipElement(el, axis, cx, cy){
   if(!el || typeof el !== 'object') return el;
   const fx = p => 2*cx - p, fy = p => 2*cy - p;
@@ -113,6 +133,18 @@ function flipElement(el, axis, cx, cy){
       } else if(Array.isArray(p)){                                  // [x,y] 数组点（与 align/distribute 同样双格式兼容）
         if(axis === 'h') p[0] = fx(p[0]||0); else p[1] = fy(p[1]||0);
       }
+    }
+  } else if(el.w != null && el.h != null){
+    if(axis === 'h'){ el.x = fx((el.x||0) + el.w); }                // 整盒镜像：镜像右缘即新左缘（x'=2cx−x−w）
+    else { el.y = fy((el.y||0) + el.h); }
+    if(el.type === 'shape' && el.shapeKind === 'line'){
+      el.anti = !el.anti;                                            // 两种镜像都交换主/反对角线
+    } else if(el.type === 'shape' && el.shapeKind === 'triangle'){
+      // 等腰三角形镜像 = 顶点朝向的纯旋转：flipH rot→-rot，flipV rot→180-rot（0顶/90右/180底/270左）
+      const r = el.rot || 0;
+      el.rot = axis === 'h' ? ((360 - r) % 360) : ((180 - r + 360) % 360);
+    } else if(el.type === 'image'){
+      if(axis === 'h') el.flipH = !el.flipH; else el.flipV = !el.flipV;   // 位图内容镜像
     }
   } else if(el.x != null || el.y != null){
     if(axis === 'h'){ el.x = fx(el.x||0); el.flipH = !el.flipH; }
@@ -696,10 +728,11 @@ function handleData(sock, buf, room){
               const set = new Set(ids);
               const sel = room.strokes.filter(el => el && set.has(el.id));
               if(sel.length === 0) break;                    // 没命中任何 id 则忽略
-              // 组质心：所有选中元素锚点（points 平均 / x,y）的均值
+              // 组质心：points 系取点均值、{x,y,w,h} 系取盒中心、点锚元素取锚点（与 rotateElement 烘焙语义配套）
               let sx = 0, sy = 0, cnt = 0;
               for(const el of sel){
                 if(Array.isArray(el.points)){ for(const p of el.points){ sx += (p.x||0); sy += (p.y||0); cnt++; } }
+                else if(el.w != null && el.h != null){ sx += (el.x||0) + el.w/2; sy += (el.y||0) + el.h/2; cnt++; }
                 else { sx += (el.x||0); sy += (el.y||0); cnt++; }
               }
               const cx = cnt ? sx / cnt : 0, cy = cnt ? sy / cnt : 0;
@@ -725,12 +758,13 @@ function handleData(sock, buf, room){
               const set = new Set(ids);
               const sel = room.strokes.filter(el => el && set.has(el.id));
               if(sel.length === 0) break;                      // 没命中任何 id 则忽略
-              // 组质心（与 rotate 相同算法，但兼容 {x,y}/[x,y] 双格式点）：所有选中元素锚点/points 的均值
+              // 组质心（与 rotate 相同算法，但兼容 {x,y}/[x,y] 双格式点）：points 点均值 / w,h 系盒中心 / 点锚锚点
               const PXf = (p)=> (p && typeof p === 'object' && p.x !== undefined) ? p.x : (Array.isArray(p) ? (p[0]||0) : 0);
               const PYf = (p)=> (p && typeof p === 'object' && p.y !== undefined) ? p.y : (Array.isArray(p) ? (p[1]||0) : 0);
               let sx = 0, sy = 0, cnt = 0;
               for(const el of sel){
                 if(Array.isArray(el.points)){ for(const p of el.points){ sx += PXf(p); sy += PYf(p); cnt++; } }
+                else if(el.w != null && el.h != null){ sx += (el.x||0) + el.w/2; sy += (el.y||0) + el.h/2; cnt++; }
                 else { sx += (el.x||0); sy += (el.y||0); cnt++; }
               }
               const cx = cnt ? sx / cnt : 0, cy = cnt ? sy / cnt : 0;
@@ -1833,9 +1867,14 @@ function handleData(sock, buf, room){
                   else if(el.type === 'frame'){ svg += '<rect x="'+clampCoord(el.x,0,1e6)+'" y="'+clampCoord(el.y,0,1e6)+'" width="'+clampCoord(el.w,0,1e6)+'" height="'+clampCoord(el.h,0,1e6)+'" fill="none" stroke="'+el.color+'" stroke-dasharray="8 5"/><text x="'+(clampCoord(el.x,0,1e6)+6)+'" y="'+(clampCoord(el.y,0,1e6)-4)+'" fill="'+el.color+'" font-family="sans-serif" font-size="13">'+escapeXml(el.label)+'</text>'; }
                   else if(el.shapeKind === 'rect'){ svg += '<rect x="'+clampCoord(el.x,0,1e6)+'" y="'+clampCoord(el.y,0,1e6)+'" width="'+clampCoord(el.w,0,1e6)+'" height="'+clampCoord(el.h,0,1e6)+'" fill="'+(el.fill||'none')+'" stroke="'+el.color+'"/>'; }
                   else if(el.shapeKind === 'ellipse'){ svg += '<ellipse cx="'+(clampCoord(el.x,0,1e6)+clampCoord(el.w,0,1e6)/2)+'" cy="'+(clampCoord(el.y,0,1e6)+clampCoord(el.h,0,1e6)/2)+'" rx="'+(clampCoord(el.w,0,1e6)/2)+'" ry="'+(clampCoord(el.h,0,1e6)/2)+'" fill="none" stroke="'+el.color+'"/>'; }
-                  else if(el.shapeKind === 'line'){ svg += '<line x1="'+clampCoord(el.x,0,1e6)+'" y1="'+clampCoord(el.y,0,1e6)+'" x2="'+clampCoord(el.x+el.w,0,1e6)+'" y2="'+clampCoord(el.y+el.h,0,1e6)+'" stroke="'+el.color+'"/>'; }
+                  else if(el.shapeKind === 'line'){ const x1=clampCoord(el.x,0,1e6), y1=clampCoord(el.y,0,1e6), x2=clampCoord(el.x+el.w,0,1e6), y2=clampCoord(el.y+el.h,0,1e6); svg += el.anti ? '<line x1="'+x1+'" y1="'+y2+'" x2="'+x2+'" y2="'+y1+'" stroke="'+el.color+'"/>' : '<line x1="'+x1+'" y1="'+y1+'" x2="'+x2+'" y2="'+y2+'" stroke="'+el.color+'"/>'; }
                   else if(el.shapeKind === 'diamond'){ svg += '<polygon points="'+(el.x+el.w/2)+','+el.y+' '+(el.x+el.w)+','+(el.y+el.h/2)+' '+(el.x+el.w/2)+','+(el.y+el.h)+' '+el.x+','+(el.y+el.h/2)+'" fill="'+(el.fill||'none')+'" stroke="'+el.color+'"/>'; }
-                  else if(el.shapeKind === 'triangle'){ svg += '<polygon points="'+(el.x+el.w/2)+','+el.y+' '+el.x+','+(el.y+el.h)+' '+(el.x+el.w)+','+(el.y+el.h)+'" fill="'+(el.fill||'none')+'" stroke="'+el.color+'"/>'; }
+                  else if(el.shapeKind === 'triangle'){ const tx=clampCoord(el.x,0,1e6), ty=clampCoord(el.y,0,1e6), tw=clampCoord(el.w,0,1e6), th=clampCoord(el.h,0,1e6); const r=((el.rot||0)%360+360)%360;   // 顶点朝向随 rot 取变体：0顶/90右/180底/270左（与 rotateElement 烘焙语义配套）
+                    const pts = r===90 ? (tx+tw)+','+(ty+th/2)+' '+tx+','+ty+' '+tx+','+(ty+th)
+                              : r===180 ? (tx+tw/2)+','+(ty+th)+' '+(tx+tw)+','+ty+' '+tx+','+ty
+                              : r===270 ? tx+','+(ty+th/2)+' '+(tx+tw)+','+ty+' '+(tx+tw)+','+(ty+th)
+                              : (tx+tw/2)+','+ty+' '+tx+','+(ty+th)+' '+(tx+tw)+','+(ty+th);
+                    svg += '<polygon points="'+pts+'" fill="'+(el.fill||'none')+'" stroke="'+el.color+'"/>'; }
                   else if(el.type === 'text'){ svg += '<text x="'+clampCoord(el.x,0,1e6)+'" y="'+clampCoord(el.y,0,1e6)+'" fill="'+el.color+'">'+escapeXml(el.text)+'</text>'; }
                 }
                 svg += '</svg>';
