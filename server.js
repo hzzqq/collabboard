@@ -163,6 +163,13 @@ function clampCoord(v, min, max){
 function escapeXml(s){
   return String(s == null ? '' : s).replace(/[<>&'"]/g, c => ({ '<':'&lt;','>':'&gt;','&':'&amp;',"'":'&apos;','"':'&quot;' }[c]));
 }
+// 文字字号钳制：width 字段即渲染字号，钳到 8..200 取整（防 10000 巨字/负值/NaN），
+// 非法输入回退默认 16（与 text op 新建默认一致）
+function clampTextWidth(v){
+  const n = Math.round(+v);
+  if(!Number.isFinite(n)) return 16;
+  return Math.max(8, Math.min(200, n));
+}
 // 聊天文本净化（R2 隐性修复）：原 chat 处理直接 obj.text.slice(0,500)，
 // 若客户端发送非字符串 text(数字/null/对象) 会抛 TypeError 并可能中断房间；
 // 现统一校验+剔除控制字符+折叠空白+长度上限，非法/纯空白直接返回 null 由调用方丢弃。
@@ -425,7 +432,7 @@ function handleData(sock, buf, room){
                   text: obj.text.slice(0, 200),
                   x: obj.x !== undefined ? (+obj.x || 0) : existing.x,
                   y: obj.y !== undefined ? (+obj.y || 0) : existing.y,
-                  width: obj.width !== undefined ? (+obj.width || 16) : existing.width
+                  width: obj.width !== undefined ? clampTextWidth(obj.width) : existing.width
                 });
                 if(typeof obj.color === 'string') updated.color = obj.color;
                 const newArr = room.strokes.slice();
@@ -438,7 +445,7 @@ function handleData(sock, buf, room){
               const t = { type:'text', id: obj.id != null ? obj.id : (sock._cid + ':' + (++strokeSeq)),
                 x: +obj.x||0, y: +obj.y||0,
                 text: obj.text.slice(0, 200), color: typeof obj.color==='string'?obj.color:'#ffffff',
-                width: +obj.width||16, author: sock._cid, authorColor: sock.color };
+                width: clampTextWidth(obj.width), author: sock._cid, authorColor: sock.color };
               hist.commitStrokes(room, room.strokes.concat(t)); broadcast(room, JSON.stringify(t), sock);
               store.saveRoom(room.name, room);
             }
@@ -1875,7 +1882,7 @@ function handleData(sock, buf, room){
                               : r===270 ? tx+','+(ty+th/2)+' '+(tx+tw)+','+ty+' '+(tx+tw)+','+(ty+th)
                               : (tx+tw/2)+','+ty+' '+tx+','+(ty+th)+' '+(tx+tw)+','+(ty+th);
                     svg += '<polygon points="'+pts+'" fill="'+(el.fill||'none')+'" stroke="'+el.color+'"/>'; }
-                  else if(el.type === 'text'){ svg += '<text x="'+clampCoord(el.x,0,1e6)+'" y="'+clampCoord(el.y,0,1e6)+'" fill="'+el.color+'">'+escapeXml(el.text)+'</text>'; }
+                  else if(el.type === 'text'){ svg += '<text x="'+clampCoord(el.x,0,1e6)+'" y="'+clampCoord(el.y,0,1e6)+'" fill="'+el.color+'" font-family="ui-monospace, monospace" font-size="'+clampTextWidth(el.width)+'">'+escapeXml(el.text)+'</text>'; }
                 }
                 svg += '</svg>';
                 sendFrame(sock, JSON.stringify({ type:'board_export', format:'svg', svg, length: svg.length }));

@@ -357,7 +357,7 @@ function drawStroke(s){
   ctx.lineWidth = s.width * dpr;
   ctx.strokeStyle = s.color; ctx.fillStyle = s.color;
   if(s.type === 'text'){
-    ctx.font = (Math.max(10, s.width) * dpr) + 'px ui-monospace, monospace';
+    ctx.font = (Math.max(10, Math.min(200, s.width)) * dpr) + 'px ui-monospace, monospace';   // 字号钳制 10..200（与 clampTextWidth 语义对齐）
     ctx.textBaseline = 'top';
     const rot = (s.rot||0) * Math.PI/180;
     ctx.translate(s.x*dpr, s.y*dpr);
@@ -911,6 +911,14 @@ document.querySelectorAll('[data-tool]').forEach(b=>{
 });
 $('color').oninput = e=> color = e.target.value;
 $('width').oninput = e=>{ width=+e.target.value; $('wVal').textContent=width; };
+// 选中单个文字元素时粗细滑条兼作字号调节：change（松手）生效，复用 text 编辑通道原地更新
+$('width').onchange = e=>{
+  if(tool !== 'select' || selectedIds.size !== 1) return;
+  const el = strokes.find(s => s && selectedIds.has(s.id));
+  if(!el || el.type !== 'text') return;
+  const w = Math.max(8, Math.min(200, Math.round(+e.target.value) || 16));
+  send({ type:'text', id: el.id, text: el.text, x: el.x, y: el.y, color: el.color, width: w });
+};
 $('fill').onchange = e=> fill = e.target.checked;
 $('snap').onchange = e=>{ snOn = e.target.checked; redraw(); };
 $('gridSize').oninput = e=>{ gridSize = +e.target.value; $('gsVal').textContent = gridSize; if(snOn) redraw(); };
